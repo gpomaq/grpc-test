@@ -10,7 +10,7 @@ service TriviaService {
   rpc GetProfile (GetProfileRequestPb) returns (GetProfileBaseResponsePb);
 
   // Gets the current active question for a specific department and trivia session.
-  rpc GetCurrentQuestion (GetCurrentQuestionRequestPb) returns (GetCurrentQuestionBaseResponse);
+  rpc GetCurrentQuestion (GetCurrentQuestionRequestPb) returns (GetCurrentQuestionBaseResponsePb);
 
   // Submits the selected option for the current question and returns correctness.
   rpc SubmitAnswer (SubmitAnswerRequestPb) returns (SubmitAnswerBaseResponsePb);
@@ -19,10 +19,16 @@ service TriviaService {
   rpc GetRewards (GetRewardsRequestPb) returns (GetRewardsBaseResponsePb);
 }
 
+// ---- GetProfile ----
+
 message GetProfileRequestPb {}
 
 message GetProfileBaseResponsePb{
-
+	string message = 1;
+	GetProfileResponsePb data = 2;
+	repeated base_response.ErrorPb errors = 3;
+	optional base_response.ExceptionDetailPb exception = 4;
+	optional string status_code = 5;
 }
 
 message GetProfileResponsePb {
@@ -30,6 +36,8 @@ message GetProfileResponsePb {
   UserQuota quota = 2;
   GlobalProgress global_progress = 3;
 }
+
+
 
 message UserProfilePb {
   string id = 1;
