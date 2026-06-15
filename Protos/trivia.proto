@@ -7,21 +7,31 @@ package trivia;
 // TriviaService defines the mock endpoints for the gamified trivia flow.
 service TriviaService {
   // Retrieves user profile progress, attempts quota, and department status.
-  rpc GetProfile (GetProfileRequest) returns (GetProfileResponse);
+  rpc GetProfile (GetProfileRequestPb) returns (GetProfileBaseResponsePb);
 
   // Gets the current active question for a specific department and trivia session.
-  rpc GetCurrentQuestion (GetCurrentQuestionRequest) returns (GetCurrentQuestionResponse);
+  rpc GetCurrentQuestion (GetCurrentQuestionRequestPb) returns (GetCurrentQuestionBaseResponse);
 
   // Submits the selected option for the current question and returns correctness.
-  rpc SubmitAnswer (SubmitAnswerRequest) returns (SubmitAnswerResponse);
+  rpc SubmitAnswer (SubmitAnswerRequestPb) returns (SubmitAnswerBaseResponsePb);
 
   // Claims and summarizes the rewards earned for a completed session.
-  rpc GetRewards (GetRewardsRequest) returns (GetRewardsResponse);
+  rpc GetRewards (GetRewardsRequestPb) returns (GetRewardsBaseResponsePb);
 }
 
-message GetProfileRequest {}
+message GetProfileRequestPb {}
 
-message UserProfile {
+message GetProfileBaseResponsePb{
+
+}
+
+message GetProfileResponsePb {
+  UserProfile user = 1;
+  UserQuota quota = 2;
+  GlobalProgress global_progress = 3;
+}
+
+message UserProfilePb {
   string id = 1;
   string name = 2;
   string gender = 3;
@@ -29,13 +39,13 @@ message UserProfile {
   string account_opening_branch = 5;
 }
 
-message UserQuota {
+message UserQuotaPb {
   int32 weekly_attempts_max = 1;
   int32 weekly_attempts_left = 2;
   string next_reset_date = 3;
 }
 
-message DepartmentProgress {
+message DepartmentProgressPb {
   string code = 1;
   string name = 2;
   string status = 3; // "locked", "unlocked", "in_progress", "completed"
@@ -43,35 +53,29 @@ message DepartmentProgress {
   int32 total_questions = 5;
 }
 
-message GlobalProgress {
+message GlobalProgressPb {
   int32 total_xp = 1;
   int32 total_yasta_coins = 2;
   repeated DepartmentProgress departments = 3;
 }
 
-message GetProfileResponse {
-  UserProfile user = 1;
-  UserQuota quota = 2;
-  GlobalProgress global_progress = 3;
-}
-
-message GetCurrentQuestionRequest {
+message GetCurrentQuestionRequestPb {
   string department_code = 1;
 }
 
-message QuestionOption {
+message QuestionOptionPb {
   string id = 1;
   string text = 2;
 }
 
-message TriviaQuestion {
+message TriviaQuestionPb {
   string id = 1;
   string category = 2; // "finanzas", "medio_ambiente", "equidad_genero"
   string title = 3;
   repeated QuestionOption options = 4;
 }
 
-message GetCurrentQuestionResponse {
+message GetCurrentQuestionResponsePb {
   string trivia_session_id = 1;
   string department = 2;
   int32 current_question_number = 3;
@@ -79,37 +83,54 @@ message GetCurrentQuestionResponse {
   TriviaQuestion question = 5;
 }
 
-message SubmitAnswerRequest {
+message SubmitAnswerRequestPb {
   string trivia_session_id = 1;
   string question_id = 2;
   string selected_option_id = 3;
 }
 
-message SubmitAnswerResponse {
+message SubmitAnswerResponsePb {
   bool is_correct = 1;
   string correct_option_id = 2;
   string explanation = 3;
   bool is_session_finished = 4;
 }
 
-message GetRewardsRequest {
+message GetRewardsRequestPb {
   string trivia_session_id = 1;
 }
 
-message TriviaScore {
+message TriviaScorePb {
   int32 correct_answers = 1;
   int32 total_questions = 2;
 }
 
-message RewardsEarned {
+message RewardsEarnedPb {
   int32 xp_bonus = 1;
   int32 yasta_coins = 2;
 }
 
-message GetRewardsResponse {
+message GetRewardsResponsePb {
   string session_id = 1;
   string department = 2;
   TriviaScore score = 3;
   RewardsEarned rewards_earned = 4;
   string message = 5;
+}
+
+
+
+// --------- BaseResponse ---------
+message ErrorPb{
+	string field = 1;
+	string message = 2;
+}
+
+message ExceptionPb{
+	string message = 1;
+	string stack_trace = 2;
+}
+
+message ExceptionDetailPb{
+	string message = 1;
 }
