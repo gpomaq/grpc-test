@@ -1,0 +1,115 @@
+syntax = "proto3";
+
+option csharp_namespace = "GrpcTest";
+
+package trivia;
+
+// TriviaService defines the mock endpoints for the gamified trivia flow.
+service TriviaService {
+  // Retrieves user profile progress, attempts quota, and department status.
+  rpc GetProfile (GetProfileRequest) returns (GetProfileResponse);
+
+  // Gets the current active question for a specific department and trivia session.
+  rpc GetCurrentQuestion (GetCurrentQuestionRequest) returns (GetCurrentQuestionResponse);
+
+  // Submits the selected option for the current question and returns correctness.
+  rpc SubmitAnswer (SubmitAnswerRequest) returns (SubmitAnswerResponse);
+
+  // Claims and summarizes the rewards earned for a completed session.
+  rpc GetRewards (GetRewardsRequest) returns (GetRewardsResponse);
+}
+
+message GetProfileRequest {}
+
+message UserProfile {
+  string id = 1;
+  string name = 2;
+  string gender = 3;
+  int32 age = 4;
+  string account_opening_branch = 5;
+}
+
+message UserQuota {
+  int32 weekly_attempts_max = 1;
+  int32 weekly_attempts_left = 2;
+  string next_reset_date = 3;
+}
+
+message DepartmentProgress {
+  string code = 1;
+  string name = 2;
+  string status = 3; // "locked", "unlocked", "in_progress", "completed"
+  int32 completed_questions = 4;
+  int32 total_questions = 5;
+}
+
+message GlobalProgress {
+  int32 total_xp = 1;
+  int32 total_yasta_coins = 2;
+  repeated DepartmentProgress departments = 3;
+}
+
+message GetProfileResponse {
+  UserProfile user = 1;
+  UserQuota quota = 2;
+  GlobalProgress global_progress = 3;
+}
+
+message GetCurrentQuestionRequest {
+  string department_code = 1;
+}
+
+message QuestionOption {
+  string id = 1;
+  string text = 2;
+}
+
+message TriviaQuestion {
+  string id = 1;
+  string category = 2; // "finanzas", "medio_ambiente", "equidad_genero"
+  string title = 3;
+  repeated QuestionOption options = 4;
+}
+
+message GetCurrentQuestionResponse {
+  string trivia_session_id = 1;
+  string department = 2;
+  int32 current_question_number = 3;
+  int32 total_questions = 4;
+  TriviaQuestion question = 5;
+}
+
+message SubmitAnswerRequest {
+  string trivia_session_id = 1;
+  string question_id = 2;
+  string selected_option_id = 3;
+}
+
+message SubmitAnswerResponse {
+  bool is_correct = 1;
+  string correct_option_id = 2;
+  string explanation = 3;
+  bool is_session_finished = 4;
+}
+
+message GetRewardsRequest {
+  string trivia_session_id = 1;
+}
+
+message TriviaScore {
+  int32 correct_answers = 1;
+  int32 total_questions = 2;
+}
+
+message RewardsEarned {
+  int32 xp_bonus = 1;
+  int32 yasta_coins = 2;
+}
+
+message GetRewardsResponse {
+  string session_id = 1;
+  string department = 2;
+  TriviaScore score = 3;
+  RewardsEarned rewards_earned = 4;
+  string message = 5;
+}
