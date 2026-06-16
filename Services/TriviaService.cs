@@ -294,7 +294,12 @@ namespace GrpcTest.Services
         {
             if (!Sessions.TryGetValue(request.TriviaSessionId, out var session))
             {
-                throw new RpcException(new Status(StatusCode.NotFound, $"La sesión de trivia '{request.TriviaSessionId}' no fue encontrada."));
+                //throw new RpcException(new Status(StatusCode.NotFound, $"La sesión de trivia '{request.TriviaSessionId}' no fue encontrada."));
+                return Task.FromResult(new SubmitAnswerBaseResponsePb
+                {
+                    StatusCode = "ERR002",
+                    Message = "La sesión de trivia no fue encontrada.",
+                });
             }
 
             if (session.CurrentQuestionIndex >= MockQuestions.Count)
@@ -311,7 +316,12 @@ namespace GrpcTest.Services
             // Validar que coincida el ID de la pregunta
             if (currentMockQ.Id != request.QuestionId)
             {
-                throw new RpcException(new Status(StatusCode.InvalidArgument, $"Se esperaba el ID de pregunta '{currentMockQ.Id}', pero se recibió '{request.QuestionId}'."));
+                //throw new RpcException(new Status(StatusCode.InvalidArgument, $"Se esperaba el ID de pregunta '{currentMockQ.Id}', pero se recibió '{request.QuestionId}'."));
+                return Task.FromResult(new SubmitAnswerBaseResponsePb
+                {
+                    StatusCode = "ERR003",
+                    Message = "Id de pregunta incorrecto.",
+                });
             }
 
             bool isCorrect = string.Equals(currentMockQ.CorrectOptionId, request.SelectedOptionId, StringComparison.OrdinalIgnoreCase);
@@ -345,12 +355,22 @@ namespace GrpcTest.Services
         {
             if (!Sessions.TryGetValue(request.TriviaSessionId, out var session))
             {
-                throw new RpcException(new Status(StatusCode.NotFound, $"La sesión de trivia '{request.TriviaSessionId}' no fue encontrada."));
+                //throw new RpcException(new Status(StatusCode.NotFound, $"La sesión de trivia '{request.TriviaSessionId}' no fue encontrada."));
+                return Task.FromResult(new GetRewardsBaseResponsePb
+                {
+                    StatusCode = "ERR002",
+                    Message = "La sesión de trivia no fue encontrada.",
+                });
             }
 
             if (session.CurrentQuestionIndex < MockQuestions.Count)
             {
-                throw new RpcException(new Status(StatusCode.FailedPrecondition, $"La sesión de trivia aún no ha sido completada. Se completaron {session.CurrentQuestionIndex} de {MockQuestions.Count} preguntas."));
+                //throw new RpcException(new Status(StatusCode.FailedPrecondition, $"La sesión de trivia aún no ha sido completada. Se completaron {session.CurrentQuestionIndex} de {MockQuestions.Count} preguntas."));
+                return Task.FromResult(new GetRewardsBaseResponsePb
+                {
+                    StatusCode = "ERR004",
+                    Message = "La sesión de trivia aún no ha sido completada.",
+                });
             }
 
             int score = session.CorrectAnswersCount;
