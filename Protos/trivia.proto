@@ -1,5 +1,6 @@
 syntax = "proto3";
 
+import "base_response.proto";
 option csharp_namespace = "GrpcTest";
 
 package trivia;
@@ -32,9 +33,9 @@ message GetProfileBaseResponsePb{
 }
 
 message GetProfileResponsePb {
-  UserProfile user = 1;
-  UserQuota quota = 2;
-  GlobalProgress global_progress = 3;
+  UserProfilePb user = 1;
+  UserQuotaPb quota = 2;
+  GlobalProgressPb global_progress = 3;
 }
 
 
@@ -64,8 +65,10 @@ message DepartmentProgressPb {
 message GlobalProgressPb {
   int32 total_xp = 1;
   int32 total_yasta_coins = 2;
-  repeated DepartmentProgress departments = 3;
+  repeated DepartmentProgressPb departments = 3;
 }
+
+// ---- GetCurrentQuestion ----
 
 message GetCurrentQuestionRequestPb {
   string department_code = 1;
@@ -80,7 +83,15 @@ message TriviaQuestionPb {
   string id = 1;
   string category = 2; // "finanzas", "medio_ambiente", "equidad_genero"
   string title = 3;
-  repeated QuestionOption options = 4;
+  repeated QuestionOptionPb options = 4;
+}
+
+message GetCurrentQuestionBaseResponsePb{
+  string message = 1;
+  GetCurrentQuestionResponsePb data = 2;
+  repeated base_response.ErrorPb errors = 3;
+  optional base_response.ExceptionDetailPb exception = 4;
+  optional string status_code = 5;
 }
 
 message GetCurrentQuestionResponsePb {
@@ -88,13 +99,23 @@ message GetCurrentQuestionResponsePb {
   string department = 2;
   int32 current_question_number = 3;
   int32 total_questions = 4;
-  TriviaQuestion question = 5;
+  TriviaQuestionPb question = 5;
 }
+
+// ---- SubmitAnswer ----
 
 message SubmitAnswerRequestPb {
   string trivia_session_id = 1;
   string question_id = 2;
   string selected_option_id = 3;
+}
+
+message SubmitAnswerBaseResponsePb{
+  string message = 1;
+  SubmitAnswerResponsePb data = 2;
+  repeated base_response.ErrorPb errors = 3;
+  optional base_response.ExceptionDetailPb exception = 4;
+  optional string status_code = 5;
 }
 
 message SubmitAnswerResponsePb {
@@ -103,6 +124,8 @@ message SubmitAnswerResponsePb {
   string explanation = 3;
   bool is_session_finished = 4;
 }
+
+// ---- GetRewards ----
 
 message GetRewardsRequestPb {
   string trivia_session_id = 1;
@@ -118,27 +141,35 @@ message RewardsEarnedPb {
   int32 yasta_coins = 2;
 }
 
+message GetRewardsBaseResponsePb{
+  string message = 1;
+  GetRewardsResponsePb data = 2;
+  repeated base_response.ErrorPb errors = 3;
+  optional base_response.ExceptionDetailPb exception = 4;
+  optional string status_code = 5;
+}
+
 message GetRewardsResponsePb {
   string session_id = 1;
   string department = 2;
-  TriviaScore score = 3;
-  RewardsEarned rewards_earned = 4;
+  TriviaScorePb score = 3;
+  RewardsEarnedPb rewards_earned = 4;
   string message = 5;
 }
 
 
 
 // --------- BaseResponse ---------
-message ErrorPb{
-	string field = 1;
-	string message = 2;
-}
-
-message ExceptionPb{
-	string message = 1;
-	string stack_trace = 2;
-}
-
-message ExceptionDetailPb{
-	string message = 1;
-}
+//message ErrorPb{
+//	string field = 1;
+//	string message = 2;
+//}
+//
+//message ExceptionPb{
+//	string message = 1;
+//	string stack_trace = 2;
+//}
+//
+//message ExceptionDetailPb{
+//	string message = 1;
+//}

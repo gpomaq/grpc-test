@@ -183,11 +183,11 @@ namespace GrpcTest.Services
             }
         };
 
-        public override Task<GetProfileResponse> GetProfile(GetProfileRequest request, ServerCallContext context)
+        public override Task<GetProfileBaseResponsePb> GetProfile(GetProfileRequestPb request, ServerCallContext context)
         {
-            var response = new GetProfileResponse
+            var response = new GetProfileResponsePb
             {
-                User = new UserProfile
+                User = new UserProfilePb
                 {
                     Id = "user_12345",
                     Name = "John Doe",
@@ -195,13 +195,13 @@ namespace GrpcTest.Services
                     Age = 28,
                     AccountOpeningBranch = "LP" // Código de departamento de apertura
                 },
-                Quota = new UserQuota
+                Quota = new UserQuotaPb
                 {
                     WeeklyAttemptsMax = 3,
                     WeeklyAttemptsLeft = 2,
                     NextResetDate = DateTime.Now.AddDays(4).ToString("o") // ISO 8601
                 },
-                GlobalProgress = new GlobalProgress
+                GlobalProgress = new GlobalProgressPb
                 {
                     TotalXp = 450,
                     TotalYastaCoins = 85
@@ -210,7 +210,7 @@ namespace GrpcTest.Services
 
             // Listado de departamentos (LP, SC, TJ, CB, OR, PT, CH, BE, PD)
             // Según reglas de negocio: LP (apertura) está completado, por tanto el resto del mapa se desbloquea.
-            var depts = new List<DepartmentProgress>
+            var depts = new List<DepartmentProgressPb>
             {
                 new() { Code = "LP", Name = "La Paz", Status = "completed", CompletedQuestions = 10, TotalQuestions = 10 },
                 new() { Code = "SC", Name = "Santa Cruz", Status = "unlocked", CompletedQuestions = 0, TotalQuestions = 10 },
@@ -225,10 +225,16 @@ namespace GrpcTest.Services
 
             response.GlobalProgress.Departments.AddRange(depts);
 
-            return Task.FromResult(response);
+            var baseResponse = new GetProfileBaseResponsePb
+            {
+                Data = response,
+                StatusCode = "SUC000"
+            };
+
+            return Task.FromResult(baseResponse);
         }
 
-        public override Task<GetCurrentQuestionResponse> GetCurrentQuestion(GetCurrentQuestionRequest request, ServerCallContext context)
+        public override Task<GetCurrentQuestionBaseResponsePb> GetCurrentQuestion(GetCurrentQuestionRequestPb request, ServerCallContext context)
         {
             string deptCode = string.IsNullOrWhiteSpace(request.DepartmentCode) ? "LP" : request.DepartmentCode.ToUpper();
 
@@ -252,13 +258,13 @@ namespace GrpcTest.Services
             var currentMockQ = MockQuestions[currentQIndex];
             session.LastQuestionId = currentMockQ.Id;
 
-            var response = new GetCurrentQuestionResponse
+            var response = new GetCurrentQuestionResponsePb
             {
                 TriviaSessionId = session.SessionId,
                 Department = session.DepartmentCode,
                 CurrentQuestionNumber = currentQIndex + 1,
                 TotalQuestions = MockQuestions.Count,
-                Question = new TriviaQuestion
+                Question = new TriviaQuestionPb
                 {
                     Id = currentMockQ.Id,
                     Category = currentMockQ.Category,
@@ -268,17 +274,23 @@ namespace GrpcTest.Services
 
             foreach (var opt in currentMockQ.Options)
             {
-                response.Question.Options.Add(new QuestionOption
+                response.Question.Options.Add(new QuestionOptionPb
                 {
                     Id = opt.Id,
                     Text = opt.Text
                 });
             }
+            
+            var baseResponse = new GetCurrentQuestionBaseResponsePb
+            {
+                Data = response,
+                StatusCode = "SUC000"
+            };
 
-            return Task.FromResult(response);
+            return Task.FromResult(baseResponse);
         }
 
-        public override Task<SubmitAnswerResponse> SubmitAnswer(SubmitAnswerRequest request, ServerCallContext context)
+        public override Task<SubmitAnswerBaseResponsePb> SubmitAnswer(SubmitAnswerRequestPb request, ServerCallContext context)
         {
             if (!Sessions.TryGetValue(request.TriviaSessionId, out var session))
             {
@@ -287,12 +299,10 @@ namespace GrpcTest.Services
 
             if (session.CurrentQuestionIndex >= MockQuestions.Count)
             {
-                return Task.FromResult(new SubmitAnswerResponse
+                return Task.FromResult(new SubmitAnswerBaseResponsePb
                 {
-                    IsCorrect = false,
-                    CorrectOptionId = "",
-                    Explanation = "La sesión ya ha finalizado. Por favor reclame sus recompensas.",
-                    IsSessionFinished = true
+                    StatusCode = "ERR001",
+                    Message = "La sesión ya ha finalizado. Por favor reclame sus recompensas.",
                 });
             }
 
@@ -314,7 +324,7 @@ namespace GrpcTest.Services
             session.CurrentQuestionIndex++;
             bool isFinished = session.CurrentQuestionIndex >= MockQuestions.Count;
 
-            var response = new SubmitAnswerResponse
+            var response = new SubmitAnswerResponsePb
             {
                 IsCorrect = isCorrect,
                 CorrectOptionId = currentMockQ.CorrectOptionId,
@@ -322,10 +332,16 @@ namespace GrpcTest.Services
                 IsSessionFinished = isFinished
             };
 
-            return Task.FromResult(response);
+            var baseResponse = new SubmitAnswerBaseResponsePb
+            {
+                Data = response,
+                StatusCode = "SUC000"
+            };
+
+            return Task.FromResult(baseResponse);
         }
 
-        public override Task<GetRewardsResponse> GetRewards(GetRewardsRequest request, ServerCallContext context)
+        public override Task<GetRewardsBaseResponsePb> GetRewards(GetRewardsRequestPb request, ServerCallContext context)
         {
             if (!Sessions.TryGetValue(request.TriviaSessionId, out var session))
             {
@@ -341,16 +357,16 @@ namespace GrpcTest.Services
             int xpBonus = score * 50;         // 50 XP por respuesta correcta
             int yastaCoins = score * 10;      // 10 yasta_coins por respuesta correcta
 
-            var response = new GetRewardsResponse
+            var response = new GetRewardsResponsePb
             {
                 SessionId = session.SessionId,
                 Department = session.DepartmentCode,
-                Score = new TriviaScore
+                Score = new TriviaScorePb
                 {
                     CorrectAnswers = score,
                     TotalQuestions = MockQuestions.Count
                 },
-                RewardsEarned = new RewardsEarned
+                RewardsEarned = new RewardsEarnedPb
                 {
                     XpBonus = xpBonus,
                     YastaCoins = yastaCoins
@@ -362,8 +378,14 @@ namespace GrpcTest.Services
 
             // Remover la sesión para no fugar memoria en el servidor mock
             Sessions.TryRemove(request.TriviaSessionId, out _);
+            
+            var baseResponse = new GetRewardsBaseResponsePb
+            {
+                Data = response,
+                StatusCode = "SUC000"
+            };
 
-            return Task.FromResult(response);
+            return Task.FromResult(baseResponse);
         }
     }
 }

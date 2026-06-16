@@ -8,6 +8,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Protobuf Include="Protos\base_response.proto" GrpcServices="Server" AdditionalImportDirs="Protos\" />
     <Protobuf Include="Protos\trivia.proto" GrpcServices="Server" AdditionalImportDirs="Protos\" />
   </ItemGroup>
 
