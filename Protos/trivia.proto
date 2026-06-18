@@ -5,18 +5,13 @@ option csharp_namespace = "GrpcTest";
 
 package trivia;
 
-// TriviaService defines the mock endpoints for the gamified trivia flow.
 service TriviaService {
-  // Retrieves user profile progress, attempts quota, and department status.
   rpc GetProfile (GetProfileRequestPb) returns (GetProfileBaseResponsePb);
 
-  // Gets the current active question for a specific department and trivia session.
   rpc GetCurrentQuestion (GetCurrentQuestionRequestPb) returns (GetCurrentQuestionBaseResponsePb);
 
-  // Submits the selected option for the current question and returns correctness.
   rpc SubmitAnswer (SubmitAnswerRequestPb) returns (SubmitAnswerBaseResponsePb);
 
-  // Claims and summarizes the rewards earned for a completed session.
   rpc GetRewards (GetRewardsRequestPb) returns (GetRewardsBaseResponsePb);
 }
 
@@ -156,20 +151,3 @@ message GetRewardsResponsePb {
   RewardsEarnedPb rewards_earned = 4;
   string message = 5;
 }
-
-
-
-// --------- BaseResponse ---------
-//message ErrorPb{
-//	string field = 1;
-//	string message = 2;
-//}
-//
-//message ExceptionPb{
-//	string message = 1;
-//	string stack_trace = 2;
-//}
-//
-//message ExceptionDetailPb{
-//	string message = 1;
-//}
