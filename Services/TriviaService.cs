@@ -7,14 +7,65 @@ namespace GrpcTest.Services
     {
         // Thread-safe dictionary to keep track of active sessions in memory
         private static readonly ConcurrentDictionary<string, TriviaSessionState> Sessions = new();
+        // Map a department code to the active trivia session id for that department (mock behavior: one active session per department)
+        private static readonly ConcurrentDictionary<string, string> DepartmentSessions = new();
+        // Background timer that removes expired sessions to avoid memory leaks
+        private static readonly TimeSpan SessionTimeout = TimeSpan.FromMinutes(30);
+        private static readonly System.Threading.Timer? CleanupTimer;
+
+        static TriviaService()
+        {
+            // Start a periodic cleanup timer to remove expired sessions
+            CleanupTimer = new System.Threading.Timer(_ =>
+            {
+                try
+                {
+                    var now = DateTime.UtcNow;
+                    var expired = Sessions.Where(kv => (now - kv.Value.LastAccessedUtc) > SessionTimeout)
+                                          .Select(kv => kv.Key)
+                                          .ToList();
+                    foreach (var id in expired)
+                    {
+                        Sessions.TryRemove(id, out var _removedSession);
+                        // remove from department map if present
+                        var deptEntries = DepartmentSessions.Where(d => d.Value == id).Select(d => d.Key).ToList();
+                        foreach (var dept in deptEntries)
+                        {
+                            DepartmentSessions.TryRemove(dept, out var _removedDeptId);
+                        }
+                    }
+                }
+                catch
+                {
+                    // ignore cleanup errors in mock
+                }
+            }, null, SessionTimeout, SessionTimeout);
+        }
 
         private class TriviaSessionState
         {
             public string SessionId { get; set; } = string.Empty;
             public string DepartmentCode { get; set; } = string.Empty;
-            public int CurrentQuestionIndex { get; set; } = 0; // 0 to 9
-            public int CorrectAnswersCount { get; set; } = 0;
+            private int _currentQuestionIndex = 0; // 0 to 9
+            private int _correctAnswersCount = 0;
             public string LastQuestionId { get; set; } = string.Empty;
+            public DateTime LastAccessedUtc { get; set; } = DateTime.UtcNow;
+
+            public int CurrentQuestionIndex
+            {
+                get => System.Threading.Volatile.Read(ref _currentQuestionIndex);
+                set => System.Threading.Volatile.Write(ref _currentQuestionIndex, value);
+            }
+
+            public int CorrectAnswersCount
+            {
+                get => System.Threading.Volatile.Read(ref _correctAnswersCount);
+                private set => System.Threading.Volatile.Write(ref _correctAnswersCount, value);
+            }
+
+            public void IncrementCorrectAnswers() => System.Threading.Interlocked.Increment(ref _correctAnswersCount);
+            public void IncrementQuestionIndex() => System.Threading.Interlocked.Increment(ref _currentQuestionIndex);
+            public void Touch() => LastAccessedUtc = DateTime.UtcNow;
         }
 
         private class MockQuestion
@@ -238,21 +289,55 @@ namespace GrpcTest.Services
         {
             string deptCode = string.IsNullOrWhiteSpace(request.DepartmentCode) ? "LP" : request.DepartmentCode.ToUpper();
 
-            // Buscar si existe sesión en curso para este departamento, o crear una nueva.
-            var session = Sessions.Values.FirstOrDefault(s => s.DepartmentCode == deptCode && s.CurrentQuestionIndex < MockQuestions.Count);
-
-            if (session == null)
+            // Try to find an active session id for the department
+            string sessionId;
+            if (!DepartmentSessions.TryGetValue(deptCode, out sessionId))
             {
-                string newSessionId = Guid.NewGuid().ToString();
+                // No active session for department: create one atomically
+                sessionId = Guid.NewGuid().ToString();
+                var newSession = new TriviaSessionState
+                {
+                    SessionId = sessionId,
+                    DepartmentCode = deptCode,
+                    CurrentQuestionIndex = 0,
+                };
+                Sessions[sessionId] = newSession;
+                DepartmentSessions[deptCode] = sessionId;
+            }
+
+            if (!Sessions.TryGetValue(sessionId, out var session))
+            {
+                // Inconsistent state: try to recreate session
+                sessionId = Guid.NewGuid().ToString();
                 session = new TriviaSessionState
+                {
+                    SessionId = sessionId,
+                    DepartmentCode = deptCode,
+                    CurrentQuestionIndex = 0,
+                };
+                Sessions[sessionId] = session;
+                DepartmentSessions[deptCode] = sessionId;
+            }
+
+            // If the session already finished all questions, create a new session for the department
+            if (session.CurrentQuestionIndex >= MockQuestions.Count)
+            {
+                var oldId = session.SessionId;
+                var newSessionId = Guid.NewGuid().ToString();
+                var newSession = new TriviaSessionState
                 {
                     SessionId = newSessionId,
                     DepartmentCode = deptCode,
                     CurrentQuestionIndex = 0,
-                    CorrectAnswersCount = 0
                 };
-                Sessions[newSessionId] = session;
+                Sessions[newSessionId] = newSession;
+                DepartmentSessions[deptCode] = newSessionId;
+                Sessions.TryRemove(oldId, out var _removedSession);
+                session = newSession;
             }
+
+            // Update last accessed timestamp
+            session.Touch();
 
             int currentQIndex = session.CurrentQuestionIndex;
             var currentMockQ = MockQuestions[currentQIndex];
@@ -280,7 +365,7 @@ namespace GrpcTest.Services
                     Text = opt.Text
                 });
             }
-            
+
             var baseResponse = new GetCurrentQuestionBaseResponsePb
             {
                 Data = response,
@@ -294,11 +379,25 @@ namespace GrpcTest.Services
         {
             if (!Sessions.TryGetValue(request.TriviaSessionId, out var session))
             {
-                //throw new RpcException(new Status(StatusCode.NotFound, $"La sesión de trivia '{request.TriviaSessionId}' no fue encontrada."));
                 return Task.FromResult(new SubmitAnswerBaseResponsePb
                 {
                     StatusCode = "ERR002",
                     Message = "La sesión de trivia no fue encontrada.",
+                });
+            }
+
+            // Check expiration
+            if ((DateTime.UtcNow - session.LastAccessedUtc) > SessionTimeout)
+            {
+                // remove expired session
+                Sessions.TryRemove(request.TriviaSessionId, out var _removedSession);
+                var deptToRemove = DepartmentSessions.Where(d => d.Value == request.TriviaSessionId).Select(d => d.Key).FirstOrDefault();
+                if (deptToRemove != null) DepartmentSessions.TryRemove(deptToRemove, out var _removedDeptId);
+
+                return Task.FromResult(new SubmitAnswerBaseResponsePb
+                {
+                    StatusCode = "ERR005",
+                    Message = "La sesión de trivia ha expirado.",
                 });
             }
 
@@ -316,7 +415,6 @@ namespace GrpcTest.Services
             // Validar que coincida el ID de la pregunta
             if (currentMockQ.Id != request.QuestionId)
             {
-                //throw new RpcException(new Status(StatusCode.InvalidArgument, $"Se esperaba el ID de pregunta '{currentMockQ.Id}', pero se recibió '{request.QuestionId}'."));
                 return Task.FromResult(new SubmitAnswerBaseResponsePb
                 {
                     StatusCode = "ERR003",
@@ -328,10 +426,13 @@ namespace GrpcTest.Services
 
             if (isCorrect)
             {
-                session.CorrectAnswersCount++;
+                session.IncrementCorrectAnswers();
             }
 
-            session.CurrentQuestionIndex++;
+            // advance question index
+            session.IncrementQuestionIndex();
+            session.Touch();
+
             bool isFinished = session.CurrentQuestionIndex >= MockQuestions.Count;
 
             var response = new SubmitAnswerResponsePb
@@ -355,7 +456,6 @@ namespace GrpcTest.Services
         {
             if (!Sessions.TryGetValue(request.TriviaSessionId, out var session))
             {
-                //throw new RpcException(new Status(StatusCode.NotFound, $"La sesión de trivia '{request.TriviaSessionId}' no fue encontrada."));
                 return Task.FromResult(new GetRewardsBaseResponsePb
                 {
                     StatusCode = "ERR002",
@@ -363,9 +463,22 @@ namespace GrpcTest.Services
                 });
             }
 
+            // Check expiration
+            if ((DateTime.UtcNow - session.LastAccessedUtc) > SessionTimeout)
+            {
+                Sessions.TryRemove(request.TriviaSessionId, out var _removedSession);
+                var deptToRemove = DepartmentSessions.Where(d => d.Value == request.TriviaSessionId).Select(d => d.Key).FirstOrDefault();
+                if (deptToRemove != null) DepartmentSessions.TryRemove(deptToRemove, out var _removedDeptId);
+
+                return Task.FromResult(new GetRewardsBaseResponsePb
+                {
+                    StatusCode = "ERR005",
+                    Message = "La sesión de trivia ha expirado.",
+                });
+            }
+
             if (session.CurrentQuestionIndex < MockQuestions.Count)
             {
-                //throw new RpcException(new Status(StatusCode.FailedPrecondition, $"La sesión de trivia aún no ha sido completada. Se completaron {session.CurrentQuestionIndex} de {MockQuestions.Count} preguntas."));
                 return Task.FromResult(new GetRewardsBaseResponsePb
                 {
                     StatusCode = "ERR004",
@@ -397,8 +510,10 @@ namespace GrpcTest.Services
             };
 
             // Remover la sesión para no fugar memoria en el servidor mock
-            Sessions.TryRemove(request.TriviaSessionId, out _);
-            
+            Sessions.TryRemove(request.TriviaSessionId, out var _removedSessionFinal);
+            var deptToRemove2 = DepartmentSessions.Where(d => d.Value == request.TriviaSessionId).Select(d => d.Key).FirstOrDefault();
+            if (deptToRemove2 != null) DepartmentSessions.TryRemove(deptToRemove2, out var _removedDeptIdFinal);
+
             var baseResponse = new GetRewardsBaseResponsePb
             {
                 Data = response,
