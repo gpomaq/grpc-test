@@ -1,8 +1,4 @@
-using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.Linq;
-using GrpcTest;
 
 namespace GrpcTest.Services
 {
@@ -301,8 +297,8 @@ namespace GrpcTest.Services
 
         private static readonly Dictionary<string, UserSeed> ValidUsers = new()
         {
-            { "1", new UserSeed("123456", "Usuario 1", "male", 28) },
-            { "2", new UserSeed("654321", "Usuario 2", "female", 34) }
+            { "1", new UserSeed("123456", "John", "male", 28) },
+            { "2", new UserSeed("654321", "Fiora", "female", 34) }
         };
 
         public static UserState? GetOrCreateUser(string idUserProfile)
