@@ -1,285 +1,145 @@
-using System.Collections.Concurrent;
+using System;
+using System.Linq;
+using System.Threading.Tasks;
 using Grpc.Core;
+using GrpcTest;
 
 namespace GrpcTest.Services
 {
     public class TriviaService : GrpcTest.TriviaService.TriviaServiceBase
     {
-        // Thread-safe dictionary to keep track of active sessions in memory
-        private static readonly ConcurrentDictionary<string, TriviaSessionState> Sessions = new();
-        // Map a department code to the active trivia session id for that department (mock behavior: one active session per department)
-        private static readonly ConcurrentDictionary<string, string> DepartmentSessions = new();
-        // Background timer that removes expired sessions to avoid memory leaks
-        private static readonly TimeSpan SessionTimeout = TimeSpan.FromMinutes(30);
-        private static readonly System.Threading.Timer? CleanupTimer;
-
-        static TriviaService()
+        // Helper method to base64-decode the JWT and extract id_user_profile and document_number
+        private (string idUserProfile, string documentNumber, string errorMsg) ParseJwtFromMetadata(Metadata metadata)
         {
-            // Start a periodic cleanup timer to remove expired sessions
-            CleanupTimer = new System.Threading.Timer(_ =>
+            var authHeader = metadata.FirstOrDefault(m => string.Equals(m.Key, "authorization", StringComparison.OrdinalIgnoreCase));
+            if (authHeader == null || string.IsNullOrEmpty(authHeader.Value))
             {
-                try
+                return (string.Empty, string.Empty, "No autenticado. Token de autenticación no proporcionado.");
+            }
+
+            var val = authHeader.Value;
+            if (!val.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+            {
+                return (string.Empty, string.Empty, "No autenticado. Formato de token inválido (debe ser 'Bearer <jwt>').");
+            }
+
+            var token = val.Substring(7).Trim();
+            try
+            {
+                var parts = token.Split('.');
+                if (parts.Length < 2)
                 {
-                    var now = DateTime.UtcNow;
-                    var expired = Sessions.Where(kv => (now - kv.Value.LastAccessedUtc) > SessionTimeout)
-                                          .Select(kv => kv.Key)
-                                          .ToList();
-                    foreach (var id in expired)
+                    return (string.Empty, string.Empty, "No autenticado. Token JWT malformado.");
+                }
+
+                var payload = parts[1];
+                payload = payload.Replace('-', '+').Replace('_', '/');
+                switch (payload.Length % 4)
+                {
+                    case 2: payload += "=="; break;
+                    case 3: payload += "="; break;
+                }
+
+                var bytes = Convert.FromBase64String(payload);
+                var jsonStr = System.Text.Encoding.UTF8.GetString(bytes);
+
+                using var doc = System.Text.Json.JsonDocument.Parse(jsonStr);
+                var root = doc.RootElement;
+
+                // Validate expiration claim "exp" if present
+                if (root.TryGetProperty("exp", out var expProp))
+                {
+                    long expSeconds = expProp.GetInt64();
+                    var expTime = DateTimeOffset.FromUnixTimeSeconds(expSeconds);
+                    if (expTime < DateTimeOffset.UtcNow)
                     {
-                        Sessions.TryRemove(id, out var _removedSession);
-                        // remove from department map if present
-                        var deptEntries = DepartmentSessions.Where(d => d.Value == id).Select(d => d.Key).ToList();
-                        foreach (var dept in deptEntries)
-                        {
-                            DepartmentSessions.TryRemove(dept, out var _removedDeptId);
-                        }
+                        return (string.Empty, string.Empty, "No autenticado. El token de autenticación ha expirado.");
                     }
                 }
-                catch
+
+                string idUserProfile = string.Empty;
+                if (root.TryGetProperty("id_user_profile", out var idProp))
                 {
-                    // ignore cleanup errors in mock
+                    idUserProfile = idProp.GetString() ?? string.Empty;
                 }
-            }, null, SessionTimeout, SessionTimeout);
-        }
+                else if (root.TryGetProperty("idUserProfile", out var idProp2))
+                {
+                    idUserProfile = idProp2.GetString() ?? string.Empty;
+                }
 
-        private class TriviaSessionState
-        {
-            public string SessionId { get; set; } = string.Empty;
-            public string DepartmentCode { get; set; } = string.Empty;
-            private int _currentQuestionIndex = 0; // 0 to 9
-            private int _correctAnswersCount = 0;
-            public string LastQuestionId { get; set; } = string.Empty;
-            public DateTime LastAccessedUtc { get; set; } = DateTime.UtcNow;
+                string documentNumber = string.Empty;
+                if (root.TryGetProperty("document_number", out var docProp))
+                {
+                    documentNumber = docProp.GetString() ?? string.Empty;
+                }
+                else if (root.TryGetProperty("documentNumber", out var docProp2))
+                {
+                    documentNumber = docProp2.GetString() ?? string.Empty;
+                }
 
-            public int CurrentQuestionIndex
-            {
-                get => System.Threading.Volatile.Read(ref _currentQuestionIndex);
-                set => System.Threading.Volatile.Write(ref _currentQuestionIndex, value);
+                if (string.IsNullOrEmpty(idUserProfile))
+                {
+                    return (string.Empty, string.Empty, "No autenticado. El claim 'id_user_profile' no se encuentra en el token.");
+                }
+
+                return (idUserProfile, documentNumber, string.Empty);
             }
-
-            public int CorrectAnswersCount
+            catch (Exception ex)
             {
-                get => System.Threading.Volatile.Read(ref _correctAnswersCount);
-                private set => System.Threading.Volatile.Write(ref _correctAnswersCount, value);
+                return (string.Empty, string.Empty, $"No autenticado. Error al descifrar el token: {ex.Message}");
             }
-
-            public void IncrementCorrectAnswers() => System.Threading.Interlocked.Increment(ref _correctAnswersCount);
-            public void IncrementQuestionIndex() => System.Threading.Interlocked.Increment(ref _currentQuestionIndex);
-            public void Touch() => LastAccessedUtc = DateTime.UtcNow;
         }
-
-        private class MockQuestion
-        {
-            public string Id { get; set; } = string.Empty;
-            public string Category { get; set; } = string.Empty;
-            public string Title { get; set; } = string.Empty;
-            public List<(string Id, string Text)> Options { get; set; } = new();
-            public string CorrectOptionId { get; set; } = string.Empty;
-            public string Explanation { get; set; } = string.Empty;
-        }
-
-        // A static list of exactly 10 questions in Spanish, contextualized for Bolivia.
-        // It guarantees variety: Finanzas, Medio Ambiente, and Equidad de Género.
-        private static readonly List<MockQuestion> MockQuestions = new()
-        {
-            new MockQuestion
-            {
-                Id = "q1",
-                Category = "finanzas",
-                Title = "¿Cuál es el principal beneficio del interés compuesto al ahorrar en un banco boliviano?",
-                Options = new()
-                {
-                    ("opt1a", "Calcula intereses únicamente sobre el monto del depósito inicial."),
-                    ("opt1b", "Genera intereses sobre el capital inicial y también sobre los intereses acumulados previamente."),
-                    ("opt1c", "Garantiza que la inflación del país nunca afectará el valor real de tus ahorros."),
-                    ("opt1d", "Se aplica únicamente en préstamos de consumo a muy corto plazo.")
-                },
-                CorrectOptionId = "opt1b",
-                Explanation = "El interés compuesto suma los intereses ganados al capital inicial de forma periódica, haciendo que el interés futuro se calcule sobre un monto mayor."
-            },
-            new MockQuestion
-            {
-                Id = "q2",
-                Category = "medio_ambiente",
-                Title = "En Bolivia, ¿cuál de las siguientes opciones representa una fuente de energía renovable clave en pleno desarrollo en el altiplano?",
-                Options = new()
-                {
-                    ("opt2a", "El carbón mineral."),
-                    ("opt2b", "La energía solar fotovoltaica (como en la planta solar de Oruro)."),
-                    ("opt2c", "El gas natural licuado."),
-                    ("opt2d", "La energía de fisión nuclear.")
-                },
-                CorrectOptionId = "opt2b",
-                Explanation = "Bolivia cuenta con plantas de energía solar (como la de Oruro) que aprovechan la alta radiación solar del altiplano para generar energía limpia y renovable."
-            },
-            new MockQuestion
-            {
-                Id = "q3",
-                Category = "equidad_genero",
-                Title = "¿Cuál es el propósito central de promover la equidad de género en las empresas e instituciones en Bolivia?",
-                Options = new()
-                {
-                    ("opt3a", "Garantizar igualdad de oportunidades, trato y remuneración justa sin importar el género."),
-                    ("opt3b", "Establecer que los hombres trabajen turnos más largos en áreas operativas."),
-                    ("opt3c", "Restringir la participación de mujeres en puestos jerárquicos o de toma de decisiones."),
-                    ("opt3d", "Dividir las tareas de oficina estrictamente bajo roles tradicionales de género.")
-                },
-                CorrectOptionId = "opt3a",
-                Explanation = "La equidad de género busca eliminar barreras históricas para asegurar oportunidades iguales y salarios justos por el mismo trabajo, beneficiando a toda la sociedad boliviana."
-            },
-            new MockQuestion
-            {
-                Id = "q4",
-                Category = "finanzas",
-                Title = "Para una familia boliviana, ¿cuál es el objetivo primordial de elaborar un presupuesto mensual en bolivianos (Bs.)?",
-                Options = new()
-                {
-                    ("opt4a", "Maximizar el límite de uso de las tarjetas de crédito."),
-                    ("opt4b", "Planificar y controlar los ingresos frente a los gastos, priorizando el ahorro y pago de deudas."),
-                    ("opt4c", "Evitar por completo cualquier tipo de consumo cultural o recreativo familiar."),
-                    ("opt4d", "Reportar todos los consumos directamente al Servicio de Impuestos Nacionales.")
-                },
-                CorrectOptionId = "opt4b",
-                Explanation = "Un presupuesto permite ordenar las finanzas familiares, asegurando que se cubran las necesidades básicas y se destine un porcentaje al ahorro antes de gastar."
-            },
-            new MockQuestion
-            {
-                Id = "q5",
-                Category = "medio_ambiente",
-                Title = "¿Cuál es una de las principales amenazas para la biodiversidad del Parque Nacional Madidi en Bolivia?",
-                Options = new()
-                {
-                    ("opt5a", "La reforestación con árboles nativos de la Amazonía."),
-                    ("opt5b", "La deforestación ilegal y la contaminación de ríos por minería aurífera sin control."),
-                    ("opt5c", "El incremento del turismo ecológico regulado y sostenible."),
-                    ("opt5d", "El desarrollo de técnicas agrícolas tradicionales de rotación de cultivos.")
-                },
-                CorrectOptionId = "opt5b",
-                Explanation = "La minería aurífera ilegal que libera mercurio en los ríos y la deforestación representan graves peligros para la fauna y comunidades indígenas del Madidi."
-            },
-            new MockQuestion
-            {
-                Id = "q6",
-                Category = "equidad_genero",
-                Title = "En el mercado laboral boliviano, ¿qué describe el concepto de 'brecha salarial de género'?",
-                Options = new()
-                {
-                    ("opt6a", "La diferencia promedio en los ingresos percibidos por hombres y mujeres que realizan trabajos de igual valor."),
-                    ("opt6b", "La diferencia de edad promedio en la que se jubilan los hombres y las mujeres bolivianas."),
-                    ("opt6c", "La cantidad de feriados anuales que corresponden por ley a cada género."),
-                    ("opt6d", "La brecha en la cantidad de horas destinadas al descanso semanal.")
-                },
-                CorrectOptionId = "opt6a",
-                Explanation = "La brecha salarial es el indicador que muestra que, en promedio, las mujeres ganan menos que los hombres por realizar trabajos con similares responsabilidades."
-            },
-            new MockQuestion
-            {
-                Id = "q7",
-                Category = "finanzas",
-                Title = "Si vives en Bolivia, ¿cuántos meses de gastos básicos se recomienda tener acumulados en tu Fondo de Emergencia?",
-                Options = new()
-                {
-                    ("opt7a", "El equivalente a una semana de gastos únicamente."),
-                    ("opt7b", "Entre 3 y 6 meses de tus gastos indispensables de subsistencia."),
-                    ("opt7c", "El equivalente al valor total de un vehículo nuevo de importación."),
-                    ("opt7d", "No es necesario tener fondos acumulados si se cuenta con tarjetas de crédito.")
-                },
-                CorrectOptionId = "opt7b",
-                Explanation = "Contar con un fondo de 3 a 6 meses de gastos te protege frente a imprevistos graves como la pérdida de empleo, problemas de salud o reparaciones mayores sin caer en deudas."
-            },
-            new MockQuestion
-            {
-                Id = "q8",
-                Category = "medio_ambiente",
-                Title = "¿Cuál es el beneficio ambiental más directo de reciclar envases plásticos y latas en nuestras ciudades bolivianas?",
-                Options = new()
-                {
-                    ("opt8a", "Incrementar la temperatura en las zonas urbanas."),
-                    ("opt8b", "Reducir la saturación de los vertederos municipales (como Alpacoma o Kara Kara) y ahorrar materias primas."),
-                    ("opt8c", "Generar lluvias más frecuentes en los valles del país."),
-                    ("opt8d", "Eliminar la necesidad de tratamiento de agua potable.")
-                },
-                CorrectOptionId = "opt8b",
-                Explanation = "Al reciclar, evitamos que estos materiales tarden cientos de años en degradarse en los saturados rellenos sanitarios de ciudades como La Paz o Cochabamba."
-            },
-            new MockQuestion
-            {
-                Id = "q9",
-                Category = "equidad_genero",
-                Title = "En Bolivia, ¿a qué se refiere el concepto de 'doble jornada laboral' que afecta principalmente a las mujeres?",
-                Options = new()
-                {
-                    ("opt9a", "A tener dos empleos de tiempo completo contratados formalmente en distintas empresas."),
-                    ("opt9b", "A la combinación del trabajo remunerado fuera del hogar con las tareas domésticas y de cuidado no remuneradas."),
-                    ("opt9c", "Al pago por horas extra trabajadas durante los fines de semana y feriados nacionales."),
-                    ("opt9d", "A la realización de guardias nocturnas obligatorias en sectores de salud o seguridad.")
-                },
-                CorrectOptionId = "opt9b",
-                Explanation = "La doble jornada describe cómo las mujeres asumen la mayor parte del trabajo doméstico y de cuidado no remunerado, sumado a su empleo laboral diario."
-            },
-            new MockQuestion
-            {
-                Id = "q10",
-                Category = "finanzas",
-                Title = "¿Qué entidad en Bolivia es la encargada de regular, supervisar y controlar el sistema financiero (bancos, cooperativas, etc.)?",
-                Options = new()
-                {
-                    ("opt10a", "El Banco Central de Bolivia (BCB) exclusivamente."),
-                    ("opt10b", "La Autoridad de Supervisión del Sistema Financiero (ASFI)."),
-                    ("opt10c", "El Servicio de Impuestos Nacionales (SIN)."),
-                    ("opt10d", "La Bolsa Boliviana de Valores (BBV).")
-                },
-                CorrectOptionId = "opt10b",
-                Explanation = "La ASFI es la institución del Estado encargada de velar por la solidez del sistema financiero y defender los derechos de los consumidores financieros en Bolivia."
-            }
-        };
 
         public override Task<GetProfileBaseResponsePb> GetProfile(GetProfileRequestPb request, ServerCallContext context)
         {
+            var (idUserProfile, documentNumber, errorMsg) = ParseJwtFromMetadata(context.RequestHeaders);
+            if (!string.IsNullOrEmpty(errorMsg))
+            {
+                return Task.FromResult(new GetProfileBaseResponsePb
+                {
+                    StatusCode = "ERR009",
+                    Message = errorMsg
+                });
+            }
+
+            var user = TriviaMockDatabase.GetOrCreateUser(idUserProfile, documentNumber);
+
+            // Compute next Monday at 00:00:00 Bolivia Time (UTC-4) for the quota reset date
+            var nextMonday = DateTime.Today.AddDays(((int)DayOfWeek.Monday - (int)DateTime.Today.DayOfWeek + 7) % 7);
+            if (nextMonday == DateTime.Today) nextMonday = nextMonday.AddDays(7);
+            var resetTime = new DateTimeOffset(nextMonday.Year, nextMonday.Month, nextMonday.Day, 0, 0, 0, TimeSpan.FromHours(-4));
+            string nextResetDate = resetTime.ToString("yyyy-MM-ddTHH:mm:sszzz");
+
             var response = new GetProfileResponsePb
             {
                 User = new UserProfilePb
                 {
-                    Id = "user_12345",
-                    Name = "John Doe",
-                    Gender = "male",
-                    Age = 28,
-                    AccountOpeningBranch = "LP" // Código de departamento de apertura
+                    Id = user.IdUserProfile,
+                    Name = user.Name,
+                    Gender = user.Gender,
+                    Age = user.Age,
+                    AccountOpeningBranch = user.AccountOpeningBranch
                 },
                 Quota = new UserQuotaPb
                 {
                     WeeklyAttemptsMax = 3,
-                    WeeklyAttemptsLeft = 2,
-                    NextResetDate = DateTime.Now.AddDays(4).ToString("o") // ISO 8601
+                    WeeklyAttemptsLeft = user.WeeklyAttemptsLeft,
+                    NextResetDate = nextResetDate
                 },
                 GlobalProgress = new GlobalProgressPb
                 {
-                    TotalXp = 450,
-                    TotalYastaCoins = 85
+                    TotalXp = user.TotalXp,
+                    TotalYastaCoins = user.TotalYastaCoins
                 }
             };
 
-            // Listado de departamentos (LP, SC, TJ, CB, OR, PT, CH, BE, PD)
-            // Según reglas de negocio: LP (apertura) está completado, por tanto el resto del mapa se desbloquea.
-            var depts = new List<DepartmentProgressPb>
-            {
-                new() { Code = "LP", Name = "La Paz", Status = "completed", CompletedQuestions = 10, TotalQuestions = 10 },
-                new() { Code = "SC", Name = "Santa Cruz", Status = "unlocked", CompletedQuestions = 0, TotalQuestions = 10 },
-                new() { Code = "TJ", Name = "Tarija", Status = "in_progress", CompletedQuestions = 4, TotalQuestions = 10 },
-                new() { Code = "CB", Name = "Cochabamba", Status = "unlocked", CompletedQuestions = 0, TotalQuestions = 10 },
-                new() { Code = "OR", Name = "Oruro", Status = "unlocked", CompletedQuestions = 0, TotalQuestions = 10 },
-                new() { Code = "PT", Name = "Potosí", Status = "unlocked", CompletedQuestions = 0, TotalQuestions = 10 },
-                new() { Code = "CH", Name = "Chuquisaca", Status = "unlocked", CompletedQuestions = 0, TotalQuestions = 10 },
-                new() { Code = "BE", Name = "Beni", Status = "unlocked", CompletedQuestions = 0, TotalQuestions = 10 },
-                new() { Code = "PD", Name = "Pando", Status = "unlocked", CompletedQuestions = 0, TotalQuestions = 10 }
-            };
-
-            response.GlobalProgress.Departments.AddRange(depts);
+            response.GlobalProgress.Departments.AddRange(user.Departments.Values.OrderBy(d => d.Name));
 
             var baseResponse = new GetProfileBaseResponsePb
             {
                 Data = response,
-                StatusCode = "SUC000"
+                StatusCode = "SUC000",
+                Message = "Perfil recuperado con éxito."
             };
 
             return Task.FromResult(baseResponse);
@@ -287,77 +147,131 @@ namespace GrpcTest.Services
 
         public override Task<GetCurrentQuestionBaseResponsePb> GetCurrentQuestion(GetCurrentQuestionRequestPb request, ServerCallContext context)
         {
-            string deptCode = string.IsNullOrWhiteSpace(request.DepartmentCode) ? "LP" : request.DepartmentCode.ToUpper();
-
-            // Try to find an active session id for the department
-            string sessionId;
-            if (!DepartmentSessions.TryGetValue(deptCode, out sessionId))
+            var (idUserProfile, documentNumber, errorMsg) = ParseJwtFromMetadata(context.RequestHeaders);
+            if (!string.IsNullOrEmpty(errorMsg))
             {
-                // No active session for department: create one atomically
-                sessionId = Guid.NewGuid().ToString();
-                var newSession = new TriviaSessionState
+                return Task.FromResult(new GetCurrentQuestionBaseResponsePb
                 {
-                    SessionId = sessionId,
-                    DepartmentCode = deptCode,
-                    CurrentQuestionIndex = 0,
-                };
-                Sessions[sessionId] = newSession;
-                DepartmentSessions[deptCode] = sessionId;
+                    StatusCode = "ERR009",
+                    Message = errorMsg
+                });
             }
 
-            if (!Sessions.TryGetValue(sessionId, out var session))
+            var user = TriviaMockDatabase.GetOrCreateUser(idUserProfile, documentNumber);
+
+            string deptCode = string.IsNullOrWhiteSpace(request.DepartmentCode) ? user.AccountOpeningBranch : request.DepartmentCode.ToUpper();
+
+            // Verify department status
+            if (user.Departments.TryGetValue(deptCode, out var deptProgress))
             {
-                // Inconsistent state: try to recreate session
-                sessionId = Guid.NewGuid().ToString();
-                session = new TriviaSessionState
+                if (deptProgress.Status == "locked")
                 {
-                    SessionId = sessionId,
-                    DepartmentCode = deptCode,
-                    CurrentQuestionIndex = 0,
-                };
-                Sessions[sessionId] = session;
-                DepartmentSessions[deptCode] = sessionId;
+                    return Task.FromResult(new GetCurrentQuestionBaseResponsePb
+                    {
+                        StatusCode = "ERR007",
+                        Message = "El departamento seleccionado está bloqueado. Debes completar primero la trivia de tu departamento de apertura."
+                    });
+                }
+            }
+            else
+            {
+                return Task.FromResult(new GetCurrentQuestionBaseResponsePb
+                {
+                    StatusCode = "ERR007",
+                    Message = $"El código de departamento '{deptCode}' no es válido."
+                });
             }
 
-            // If the session already finished all questions, create a new session for the department
-            if (session.CurrentQuestionIndex >= MockQuestions.Count)
+            // Retrieve session
+            TriviaSessionState? session = null;
+            if (!string.IsNullOrEmpty(request.TriviaSessionId))
             {
-                var oldId = session.SessionId;
-                var newSessionId = Guid.NewGuid().ToString();
-                var newSession = new TriviaSessionState
+                session = TriviaMockDatabase.GetSession(request.TriviaSessionId);
+                if (session == null)
                 {
-                    SessionId = newSessionId,
-                    DepartmentCode = deptCode,
-                    CurrentQuestionIndex = 0,
-                };
-                Sessions[newSessionId] = newSession;
-                DepartmentSessions[deptCode] = newSessionId;
-                Sessions.TryRemove(oldId, out var _removedSession);
-                session = newSession;
+                    return Task.FromResult(new GetCurrentQuestionBaseResponsePb
+                    {
+                        StatusCode = "ERR002",
+                        Message = "La sesión de trivia no fue encontrada o ha expirado."
+                    });
+                }
+                if (session.IdUserProfile != idUserProfile)
+                {
+                    return Task.FromResult(new GetCurrentQuestionBaseResponsePb
+                    {
+                        StatusCode = "ERR009",
+                        Message = "El token de autenticación no coincide con el creador de la sesión."
+                    });
+                }
+            }
+            else
+            {
+                session = TriviaMockDatabase.GetActiveSessionForDepartment(idUserProfile, deptCode);
             }
 
-            // Update last accessed timestamp
+            // If starting a new session, verify attempts and deduct
+            if (session == null)
+            {
+                if (user.WeeklyAttemptsLeft <= 0)
+                {
+                    return Task.FromResult(new GetCurrentQuestionBaseResponsePb
+                    {
+                        StatusCode = "ERR006",
+                        Message = "Has agotado tus intentos semanales permitidos para jugar trivias."
+                    });
+                }
+
+                user.WeeklyAttemptsLeft--;
+
+                session = TriviaMockDatabase.StartNewSession(idUserProfile, deptCode);
+
+                if (deptProgress.Status == "unlocked")
+                {
+                    deptProgress.Status = "in_progress";
+                }
+            }
+
             session.Touch();
 
-            int currentQIndex = session.CurrentQuestionIndex;
-            var currentMockQ = MockQuestions[currentQIndex];
-            session.LastQuestionId = currentMockQ.Id;
+            int totalQuestions = TriviaMockDatabase.GetTotalQuestionsCount();
+            if (session.CurrentQuestionIndex >= totalQuestions)
+            {
+                return Task.FromResult(new GetCurrentQuestionBaseResponsePb
+                {
+                    StatusCode = "ERR001",
+                    Message = "La sesión ya ha finalizado. Por favor reclame sus recompensas."
+                });
+            }
+
+            var mockQuestion = TriviaMockDatabase.GetQuestionByIndex(session.CurrentQuestionIndex);
+            if (mockQuestion == null)
+            {
+                return Task.FromResult(new GetCurrentQuestionBaseResponsePb
+                {
+                    StatusCode = "ERR002",
+                    Message = "La pregunta solicitada no se pudo cargar."
+                });
+            }
+
+            session.LastQuestionId = mockQuestion.Id;
 
             var response = new GetCurrentQuestionResponsePb
             {
                 TriviaSessionId = session.SessionId,
                 Department = session.DepartmentCode,
-                CurrentQuestionNumber = currentQIndex + 1,
-                TotalQuestions = MockQuestions.Count,
+                CurrentQuestionNumber = session.CurrentQuestionIndex + 1,
+                TotalQuestions = totalQuestions,
                 Question = new TriviaQuestionPb
                 {
-                    Id = currentMockQ.Id,
-                    Category = currentMockQ.Category,
-                    Title = currentMockQ.Title
+                    Id = mockQuestion.Id,
+                    Category = mockQuestion.Category,
+                    CategoryLabel = mockQuestion.CategoryLabel,
+                    CategoryIconKey = mockQuestion.CategoryIconKey,
+                    Title = mockQuestion.Title
                 }
             };
 
-            foreach (var opt in currentMockQ.Options)
+            foreach (var opt in mockQuestion.Options)
             {
                 response.Question.Options.Add(new QuestionOptionPb
                 {
@@ -369,7 +283,8 @@ namespace GrpcTest.Services
             var baseResponse = new GetCurrentQuestionBaseResponsePb
             {
                 Data = response,
-                StatusCode = "SUC000"
+                StatusCode = "SUC000",
+                Message = "Pregunta recuperada con éxito."
             };
 
             return Task.FromResult(baseResponse);
@@ -377,76 +292,122 @@ namespace GrpcTest.Services
 
         public override Task<SubmitAnswerBaseResponsePb> SubmitAnswer(SubmitAnswerRequestPb request, ServerCallContext context)
         {
-            if (!Sessions.TryGetValue(request.TriviaSessionId, out var session))
+            var (idUserProfile, documentNumber, errorMsg) = ParseJwtFromMetadata(context.RequestHeaders);
+            if (!string.IsNullOrEmpty(errorMsg))
+            {
+                return Task.FromResult(new SubmitAnswerBaseResponsePb
+                {
+                    StatusCode = "ERR009",
+                    Message = errorMsg
+                });
+            }
+
+            var session = TriviaMockDatabase.GetSession(request.TriviaSessionId);
+            if (session == null)
             {
                 return Task.FromResult(new SubmitAnswerBaseResponsePb
                 {
                     StatusCode = "ERR002",
-                    Message = "La sesión de trivia no fue encontrada.",
+                    Message = "La sesión de trivia no fue encontrada."
                 });
             }
 
-            // Check expiration
-            if ((DateTime.UtcNow - session.LastAccessedUtc) > SessionTimeout)
+            if (session.IdUserProfile != idUserProfile)
             {
-                // remove expired session
-                Sessions.TryRemove(request.TriviaSessionId, out var _removedSession);
-                var deptToRemove = DepartmentSessions.Where(d => d.Value == request.TriviaSessionId).Select(d => d.Key).FirstOrDefault();
-                if (deptToRemove != null) DepartmentSessions.TryRemove(deptToRemove, out var _removedDeptId);
+                return Task.FromResult(new SubmitAnswerBaseResponsePb
+                {
+                    StatusCode = "ERR009",
+                    Message = "La sesión de trivia especificada no pertenece al usuario autenticado."
+                });
+            }
 
+            // Check session timeout
+            if ((DateTime.UtcNow - session.LastAccessedUtc) > TriviaMockDatabase.SessionTimeout)
+            {
+                TriviaMockDatabase.TerminateSession(session.SessionId);
                 return Task.FromResult(new SubmitAnswerBaseResponsePb
                 {
                     StatusCode = "ERR005",
-                    Message = "La sesión de trivia ha expirado.",
+                    Message = "La sesión de trivia ha expirado por inactividad."
                 });
             }
 
-            if (session.CurrentQuestionIndex >= MockQuestions.Count)
+            int totalQuestions = TriviaMockDatabase.GetTotalQuestionsCount();
+            if (session.CurrentQuestionIndex >= totalQuestions)
             {
                 return Task.FromResult(new SubmitAnswerBaseResponsePb
                 {
                     StatusCode = "ERR001",
-                    Message = "La sesión ya ha finalizado. Por favor reclame sus recompensas.",
+                    Message = "La sesión ya ha finalizado. Por favor reclame sus recompensas."
                 });
             }
 
-            var currentMockQ = MockQuestions[session.CurrentQuestionIndex];
+            var mockQuestion = TriviaMockDatabase.GetQuestionByIndex(session.CurrentQuestionIndex);
+            if (mockQuestion == null)
+            {
+                return Task.FromResult(new SubmitAnswerBaseResponsePb
+                {
+                    StatusCode = "ERR002",
+                    Message = "No se pudo recuperar la pregunta en curso."
+                });
+            }
 
-            // Validar que coincida el ID de la pregunta
-            if (currentMockQ.Id != request.QuestionId)
+            // Validate question_id matches current question index
+            if (mockQuestion.Id != request.QuestionId)
             {
                 return Task.FromResult(new SubmitAnswerBaseResponsePb
                 {
                     StatusCode = "ERR003",
-                    Message = "Id de pregunta incorrecto.",
+                    Message = "La pregunta enviada no corresponde al orden actual de tu sesión de trivia (mismatch de question_id)."
                 });
             }
 
-            bool isCorrect = string.Equals(currentMockQ.CorrectOptionId, request.SelectedOptionId, StringComparison.OrdinalIgnoreCase);
+            // Validate selected_option_id belongs to the question
+            bool optionExists = mockQuestion.Options.Any(opt => string.Equals(opt.Id, request.SelectedOptionId, StringComparison.OrdinalIgnoreCase));
+            if (!optionExists)
+            {
+                return Task.FromResult(new SubmitAnswerBaseResponsePb
+                {
+                    StatusCode = "ERR008",
+                    Message = "La opción seleccionada es inválida o no corresponde a las opciones de la pregunta."
+                });
+            }
+
+            bool isCorrect = string.Equals(mockQuestion.CorrectOptionId, request.SelectedOptionId, StringComparison.OrdinalIgnoreCase);
+            int xpEarned = isCorrect ? 50 : 0;
 
             if (isCorrect)
             {
-                session.IncrementCorrectAnswers();
+                session.CorrectAnswersCount++;
             }
 
-            // advance question index
-            session.IncrementQuestionIndex();
+            // Advance session question pointer
+            session.CurrentQuestionIndex++;
             session.Touch();
 
-            bool isFinished = session.CurrentQuestionIndex >= MockQuestions.Count;
+            bool isFinished = session.CurrentQuestionIndex >= totalQuestions;
+
+            // Update user progress (completed_questions field)
+            var user = TriviaMockDatabase.GetOrCreateUser(idUserProfile, documentNumber);
+            if (user.Departments.TryGetValue(session.DepartmentCode, out var deptProgress))
+            {
+                deptProgress.CompletedQuestions = session.CurrentQuestionIndex;
+            }
 
             var response = new SubmitAnswerResponsePb
             {
                 IsCorrect = isCorrect,
-                CorrectOptionId = currentMockQ.CorrectOptionId,
-                Explanation = currentMockQ.Explanation,
-                IsSessionFinished = isFinished
+                CorrectOptionId = mockQuestion.CorrectOptionId,
+                Explanation = mockQuestion.Explanation,
+                IsSessionFinished = isFinished,
+                XpEarned = xpEarned
             };
 
             var baseResponse = new SubmitAnswerBaseResponsePb
             {
                 Data = response,
-                StatusCode = "SUC000"
+                StatusCode = "SUC000",
+                Message = isCorrect ? "Respuesta correcta registrada." : "Respuesta incorrecta registrada."
             };
 
             return Task.FromResult(baseResponse);
@@ -454,41 +415,88 @@ namespace GrpcTest.Services
 
         public override Task<GetRewardsBaseResponsePb> GetRewards(GetRewardsRequestPb request, ServerCallContext context)
         {
-            if (!Sessions.TryGetValue(request.TriviaSessionId, out var session))
+            var (idUserProfile, documentNumber, errorMsg) = ParseJwtFromMetadata(context.RequestHeaders);
+            if (!string.IsNullOrEmpty(errorMsg))
+            {
+                return Task.FromResult(new GetRewardsBaseResponsePb
+                {
+                    StatusCode = "ERR009",
+                    Message = errorMsg
+                });
+            }
+
+            var session = TriviaMockDatabase.GetSession(request.TriviaSessionId);
+            if (session == null)
             {
                 return Task.FromResult(new GetRewardsBaseResponsePb
                 {
                     StatusCode = "ERR002",
-                    Message = "La sesión de trivia no fue encontrada.",
+                    Message = "La sesión de trivia no fue encontrada."
                 });
             }
 
-            // Check expiration
-            if ((DateTime.UtcNow - session.LastAccessedUtc) > SessionTimeout)
+            if (session.IdUserProfile != idUserProfile)
             {
-                Sessions.TryRemove(request.TriviaSessionId, out var _removedSession);
-                var deptToRemove = DepartmentSessions.Where(d => d.Value == request.TriviaSessionId).Select(d => d.Key).FirstOrDefault();
-                if (deptToRemove != null) DepartmentSessions.TryRemove(deptToRemove, out var _removedDeptId);
+                return Task.FromResult(new GetRewardsBaseResponsePb
+                {
+                    StatusCode = "ERR009",
+                    Message = "La sesión de trivia especificada no pertenece al usuario autenticado."
+                });
+            }
 
+            // Check session timeout
+            if ((DateTime.UtcNow - session.LastAccessedUtc) > TriviaMockDatabase.SessionTimeout)
+            {
+                TriviaMockDatabase.TerminateSession(session.SessionId);
                 return Task.FromResult(new GetRewardsBaseResponsePb
                 {
                     StatusCode = "ERR005",
-                    Message = "La sesión de trivia ha expirado.",
+                    Message = "La sesión de trivia ha expirado por inactividad."
                 });
             }
 
-            if (session.CurrentQuestionIndex < MockQuestions.Count)
+            int totalQuestions = TriviaMockDatabase.GetTotalQuestionsCount();
+            if (session.CurrentQuestionIndex < totalQuestions)
             {
                 return Task.FromResult(new GetRewardsBaseResponsePb
                 {
                     StatusCode = "ERR004",
-                    Message = "La sesión de trivia aún no ha sido completada.",
+                    Message = $"La sesión de trivia aún no ha sido completada. Se completaron {session.CurrentQuestionIndex} de {totalQuestions} preguntas."
                 });
             }
 
+            var user = TriviaMockDatabase.GetOrCreateUser(idUserProfile, documentNumber);
+
             int score = session.CorrectAnswersCount;
-            int xpBonus = score * 50;         // 50 XP por respuesta correcta
-            int yastaCoins = score * 10;      // 10 yasta_coins por respuesta correcta
+            int xpFromQuestions = score * 50;
+            int xpBonus = 100; // completion bonus
+            int totalXpEarned = xpFromQuestions + xpBonus;
+            int yastaCoinsEarned = score * 10;
+
+            // Increment user total scores
+            user.TotalXp += totalXpEarned;
+            user.TotalYastaCoins += yastaCoinsEarned;
+
+            // Mark department as completed and unlock others if applicable
+            var unlockedDepts = new List<string>();
+            if (user.Departments.TryGetValue(session.DepartmentCode, out var deptProgress))
+            {
+                deptProgress.Status = "completed";
+                deptProgress.CompletedQuestions = totalQuestions;
+
+                // If completed department is the opening branch, unlock all other departments
+                if (string.Equals(session.DepartmentCode, user.AccountOpeningBranch, StringComparison.OrdinalIgnoreCase))
+                {
+                    TriviaMockDatabase.UnlockOtherDepartments(user);
+                    foreach (var dept in user.Departments.Values)
+                    {
+                        if (!string.Equals(dept.Code, user.AccountOpeningBranch, StringComparison.OrdinalIgnoreCase))
+                        {
+                            unlockedDepts.Add(dept.Code);
+                        }
+                    }
+                }
+            }
 
             var response = new GetRewardsResponsePb
             {
@@ -497,27 +505,30 @@ namespace GrpcTest.Services
                 Score = new TriviaScorePb
                 {
                     CorrectAnswers = score,
-                    TotalQuestions = MockQuestions.Count
+                    TotalQuestions = totalQuestions
                 },
                 RewardsEarned = new RewardsEarnedPb
                 {
-                    XpBonus = xpBonus,
-                    YastaCoins = yastaCoins
+                    XpBonus = totalXpEarned,
+                    YastaCoins = yastaCoinsEarned
                 },
-                Message = score >= 7 
-                    ? $"¡Excelente trabajo! Lograste un puntaje de {score}/{MockQuestions.Count} y desbloqueaste altas recompensas." 
-                    : $"¡Buen intento! Lograste un puntaje de {score}/{MockQuestions.Count}. ¡Sigue aprendiendo y mejora en la siguiente ronda!"
+                Message = score >= 7
+                    ? $"¡Excelente trabajo! Lograste un puntaje de {score}/{totalQuestions} y desbloqueaste altas recompensas."
+                    : $"¡Buen intento! Lograste un puntaje de {score}/{totalQuestions}. ¡Sigue aprendiendo y mejora en la siguiente ronda!",
+                WeeklyAttemptsLeft = user.WeeklyAttemptsLeft,
+                DepartmentStatus = "completed"
             };
 
-            // Remover la sesión para no fugar memoria en el servidor mock
-            Sessions.TryRemove(request.TriviaSessionId, out var _removedSessionFinal);
-            var deptToRemove2 = DepartmentSessions.Where(d => d.Value == request.TriviaSessionId).Select(d => d.Key).FirstOrDefault();
-            if (deptToRemove2 != null) DepartmentSessions.TryRemove(deptToRemove2, out var _removedDeptIdFinal);
+            response.UnlockedDepartmentCodes.AddRange(unlockedDepts);
+
+            // Clean up session from database
+            TriviaMockDatabase.TerminateSession(session.SessionId);
 
             var baseResponse = new GetRewardsBaseResponsePb
             {
                 Data = response,
-                StatusCode = "SUC000"
+                StatusCode = "SUC000",
+                Message = "Recompensas liquidadas y reclamadas con éxito."
             };
 
             return Task.FromResult(baseResponse);

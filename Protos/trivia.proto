@@ -72,6 +72,7 @@ message GlobalProgressPb {
 
 message GetCurrentQuestionRequestPb {
   string department_code = 1;
+  string trivia_session_id = 2;
 }
 
 message QuestionOptionPb {
@@ -84,6 +85,8 @@ message TriviaQuestionPb {
   string category = 2; // "finanzas", "medio_ambiente", "equidad_genero"
   string title = 3;
   repeated QuestionOptionPb options = 4;
+  string category_label = 5;
+  string category_icon_key = 6;
 }
 
 message GetCurrentQuestionBaseResponsePb{
@@ -123,6 +126,7 @@ message SubmitAnswerResponsePb {
   string correct_option_id = 2;
   string explanation = 3;
   bool is_session_finished = 4;
+  int32 xp_earned = 5;
 }
 
 // ---- GetRewards ----
@@ -155,6 +159,9 @@ message GetRewardsResponsePb {
   TriviaScorePb score = 3;
   RewardsEarnedPb rewards_earned = 4;
   string message = 5;
+  int32 weekly_attempts_left = 6;
+  string department_status = 7;
+  repeated string unlocked_department_codes = 8;
 }
 
 
