@@ -3,6 +3,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using Grpc.Core;
 using GrpcTest;
+using GrpcTest.Errors;
 
 namespace GrpcTest.Services
 {
@@ -51,7 +52,7 @@ namespace GrpcTest.Services
                 {
                     long expSeconds = expProp.GetInt64();
                     var expTime = DateTimeOffset.FromUnixTimeSeconds(expSeconds);
-                    if (expTime < DateTimeOffset.UtcNow)
+                    if (expTime < BoliviaClock.Now)
                     {
                         return (string.Empty, string.Empty, "No autenticado. El token de autenticación ha expirado.");
                     }
@@ -92,23 +93,28 @@ namespace GrpcTest.Services
 
         public override Task<GetProfileBaseResponsePb> GetProfile(GetProfileRequestPb request, ServerCallContext context)
         {
-            var (idUserProfile, documentNumber, errorMsg) = ParseJwtFromMetadata(context.RequestHeaders);
+            var (idUserProfile, _, errorMsg) = ParseJwtFromMetadata(context.RequestHeaders);
             if (!string.IsNullOrEmpty(errorMsg))
             {
                 return Task.FromResult(new GetProfileBaseResponsePb
                 {
-                    StatusCode = "ERR009",
+                    StatusCode = ErrorCode.ERR009,
                     Message = errorMsg
                 });
             }
 
-            var user = TriviaMockDatabase.GetOrCreateUser(idUserProfile, documentNumber);
+            var user = TriviaMockDatabase.GetOrCreateUser(idUserProfile);
+            if (user == null)
+            {
+                return Task.FromResult(new GetProfileBaseResponsePb
+                {
+                    StatusCode = ErrorCode.ERR010,
+                    Message = $"No se encontró un usuario registrado con id_user_profile '{idUserProfile}'."
+                });
+            }
 
-            // Compute next Monday at 00:00:00 Bolivia Time (UTC-4) for the quota reset date
-            var nextMonday = DateTime.Today.AddDays(((int)DayOfWeek.Monday - (int)DateTime.Today.DayOfWeek + 7) % 7);
-            if (nextMonday == DateTime.Today) nextMonday = nextMonday.AddDays(7);
-            var resetTime = new DateTimeOffset(nextMonday.Year, nextMonday.Month, nextMonday.Day, 0, 0, 0, TimeSpan.FromHours(-4));
-            string nextResetDate = resetTime.ToString("yyyy-MM-ddTHH:mm:sszzz");
+            TriviaMockDatabase.EnsureWeeklyAttemptsFresh(user);
+            string nextResetDate = user.NextAttemptsResetAt.ToString("yyyy-MM-ddTHH:mm:sszzz");
 
             var response = new GetProfileResponsePb
             {
@@ -122,7 +128,7 @@ namespace GrpcTest.Services
                 },
                 Quota = new UserQuotaPb
                 {
-                    WeeklyAttemptsMax = 3,
+                    WeeklyAttemptsMax = TriviaMockDatabase.WeeklyAttemptsMax,
                     WeeklyAttemptsLeft = user.WeeklyAttemptsLeft,
                     NextResetDate = nextResetDate
                 },
@@ -138,7 +144,7 @@ namespace GrpcTest.Services
             var baseResponse = new GetProfileBaseResponsePb
             {
                 Data = response,
-                StatusCode = "SUC000",
+                StatusCode = ErrorCode.SUC000,
                 Message = "Perfil recuperado con éxito."
             };
 
@@ -147,17 +153,27 @@ namespace GrpcTest.Services
 
         public override Task<GetCurrentQuestionBaseResponsePb> GetCurrentQuestion(GetCurrentQuestionRequestPb request, ServerCallContext context)
         {
-            var (idUserProfile, documentNumber, errorMsg) = ParseJwtFromMetadata(context.RequestHeaders);
+            var (idUserProfile, _, errorMsg) = ParseJwtFromMetadata(context.RequestHeaders);
             if (!string.IsNullOrEmpty(errorMsg))
             {
                 return Task.FromResult(new GetCurrentQuestionBaseResponsePb
                 {
-                    StatusCode = "ERR009",
+                    StatusCode = ErrorCode.ERR009,
                     Message = errorMsg
                 });
             }
 
-            var user = TriviaMockDatabase.GetOrCreateUser(idUserProfile, documentNumber);
+            var user = TriviaMockDatabase.GetOrCreateUser(idUserProfile);
+            if (user == null)
+            {
+                return Task.FromResult(new GetCurrentQuestionBaseResponsePb
+                {
+                    StatusCode = ErrorCode.ERR010,
+                    Message = $"No se encontró un usuario registrado con id_user_profile '{idUserProfile}'."
+                });
+            }
+
+            TriviaMockDatabase.EnsureWeeklyAttemptsFresh(user);
 
             string deptCode = string.IsNullOrWhiteSpace(request.DepartmentCode) ? user.AccountOpeningBranch : request.DepartmentCode.ToUpper();
 
@@ -168,7 +184,7 @@ namespace GrpcTest.Services
                 {
                     return Task.FromResult(new GetCurrentQuestionBaseResponsePb
                     {
-                        StatusCode = "ERR007",
+                        StatusCode = ErrorCode.ERR007,
                         Message = "El departamento seleccionado está bloqueado. Debes completar primero la trivia de tu departamento de apertura."
                     });
                 }
@@ -177,7 +193,7 @@ namespace GrpcTest.Services
             {
                 return Task.FromResult(new GetCurrentQuestionBaseResponsePb
                 {
-                    StatusCode = "ERR007",
+                    StatusCode = ErrorCode.ERR007,
                     Message = $"El código de departamento '{deptCode}' no es válido."
                 });
             }
@@ -191,7 +207,7 @@ namespace GrpcTest.Services
                 {
                     return Task.FromResult(new GetCurrentQuestionBaseResponsePb
                     {
-                        StatusCode = "ERR002",
+                        StatusCode = ErrorCode.ERR002,
                         Message = "La sesión de trivia no fue encontrada o ha expirado."
                     });
                 }
@@ -199,8 +215,16 @@ namespace GrpcTest.Services
                 {
                     return Task.FromResult(new GetCurrentQuestionBaseResponsePb
                     {
-                        StatusCode = "ERR009",
+                        StatusCode = ErrorCode.ERR009,
                         Message = "El token de autenticación no coincide con el creador de la sesión."
+                    });
+                }
+                if (!string.Equals(session.DepartmentCode, deptCode, StringComparison.OrdinalIgnoreCase))
+                {
+                    return Task.FromResult(new GetCurrentQuestionBaseResponsePb
+                    {
+                        StatusCode = ErrorCode.ERR007,
+                        Message = $"El department_code '{deptCode}' no corresponde al departamento de la sesión de trivia especificada ('{session.DepartmentCode}')."
                     });
                 }
             }
@@ -216,7 +240,7 @@ namespace GrpcTest.Services
                 {
                     return Task.FromResult(new GetCurrentQuestionBaseResponsePb
                     {
-                        StatusCode = "ERR006",
+                        StatusCode = ErrorCode.ERR006,
                         Message = "Has agotado tus intentos semanales permitidos para jugar trivias."
                     });
                 }
@@ -238,7 +262,7 @@ namespace GrpcTest.Services
             {
                 return Task.FromResult(new GetCurrentQuestionBaseResponsePb
                 {
-                    StatusCode = "ERR001",
+                    StatusCode = ErrorCode.ERR001,
                     Message = "La sesión ya ha finalizado. Por favor reclame sus recompensas."
                 });
             }
@@ -248,7 +272,7 @@ namespace GrpcTest.Services
             {
                 return Task.FromResult(new GetCurrentQuestionBaseResponsePb
                 {
-                    StatusCode = "ERR002",
+                    StatusCode = ErrorCode.ERR002,
                     Message = "La pregunta solicitada no se pudo cargar."
                 });
             }
@@ -283,7 +307,7 @@ namespace GrpcTest.Services
             var baseResponse = new GetCurrentQuestionBaseResponsePb
             {
                 Data = response,
-                StatusCode = "SUC000",
+                StatusCode = ErrorCode.SUC000,
                 Message = "Pregunta recuperada con éxito."
             };
 
@@ -292,12 +316,12 @@ namespace GrpcTest.Services
 
         public override Task<SubmitAnswerBaseResponsePb> SubmitAnswer(SubmitAnswerRequestPb request, ServerCallContext context)
         {
-            var (idUserProfile, documentNumber, errorMsg) = ParseJwtFromMetadata(context.RequestHeaders);
+            var (idUserProfile, _, errorMsg) = ParseJwtFromMetadata(context.RequestHeaders);
             if (!string.IsNullOrEmpty(errorMsg))
             {
                 return Task.FromResult(new SubmitAnswerBaseResponsePb
                 {
-                    StatusCode = "ERR009",
+                    StatusCode = ErrorCode.ERR009,
                     Message = errorMsg
                 });
             }
@@ -307,7 +331,7 @@ namespace GrpcTest.Services
             {
                 return Task.FromResult(new SubmitAnswerBaseResponsePb
                 {
-                    StatusCode = "ERR002",
+                    StatusCode = ErrorCode.ERR002,
                     Message = "La sesión de trivia no fue encontrada."
                 });
             }
@@ -316,111 +340,127 @@ namespace GrpcTest.Services
             {
                 return Task.FromResult(new SubmitAnswerBaseResponsePb
                 {
-                    StatusCode = "ERR009",
+                    StatusCode = ErrorCode.ERR009,
                     Message = "La sesión de trivia especificada no pertenece al usuario autenticado."
                 });
             }
 
+            var user = TriviaMockDatabase.GetOrCreateUser(idUserProfile);
+            if (user == null)
+            {
+                return Task.FromResult(new SubmitAnswerBaseResponsePb
+                {
+                    StatusCode = ErrorCode.ERR010,
+                    Message = $"No se encontró un usuario registrado con id_user_profile '{idUserProfile}'."
+                });
+            }
+
             // Check session timeout
-            if ((DateTime.UtcNow - session.LastAccessedUtc) > TriviaMockDatabase.SessionTimeout)
+            if ((BoliviaClock.Now - session.LastAccessedAt) > TriviaMockDatabase.SessionTimeout)
             {
                 TriviaMockDatabase.TerminateSession(session.SessionId);
                 return Task.FromResult(new SubmitAnswerBaseResponsePb
                 {
-                    StatusCode = "ERR005",
+                    StatusCode = ErrorCode.ERR005,
                     Message = "La sesión de trivia ha expirado por inactividad."
                 });
             }
 
-            int totalQuestions = TriviaMockDatabase.GetTotalQuestionsCount();
-            if (session.CurrentQuestionIndex >= totalQuestions)
+            // Everything below reads and mutates this session's counters, so it runs under
+            // the session's lock — otherwise two concurrent submits for the same question
+            // (double tap, client retry) could both read the same CurrentQuestionIndex and
+            // each advance/score it independently.
+            lock (session.Lock)
             {
-                return Task.FromResult(new SubmitAnswerBaseResponsePb
+                int totalQuestions = TriviaMockDatabase.GetTotalQuestionsCount();
+                if (session.CurrentQuestionIndex >= totalQuestions)
                 {
-                    StatusCode = "ERR001",
-                    Message = "La sesión ya ha finalizado. Por favor reclame sus recompensas."
-                });
-            }
+                    return Task.FromResult(new SubmitAnswerBaseResponsePb
+                    {
+                        StatusCode = ErrorCode.ERR001,
+                        Message = "La sesión ya ha finalizado. Por favor reclame sus recompensas."
+                    });
+                }
 
-            var mockQuestion = TriviaMockDatabase.GetQuestionByIndex(session.CurrentQuestionIndex);
-            if (mockQuestion == null)
-            {
-                return Task.FromResult(new SubmitAnswerBaseResponsePb
+                var mockQuestion = TriviaMockDatabase.GetQuestionByIndex(session.CurrentQuestionIndex);
+                if (mockQuestion == null)
                 {
-                    StatusCode = "ERR002",
-                    Message = "No se pudo recuperar la pregunta en curso."
-                });
-            }
+                    return Task.FromResult(new SubmitAnswerBaseResponsePb
+                    {
+                        StatusCode = ErrorCode.ERR002,
+                        Message = "No se pudo recuperar la pregunta en curso."
+                    });
+                }
 
-            // Validate question_id matches current question index
-            if (mockQuestion.Id != request.QuestionId)
-            {
-                return Task.FromResult(new SubmitAnswerBaseResponsePb
+                // Validate question_id matches current question index
+                if (mockQuestion.Id != request.QuestionId)
                 {
-                    StatusCode = "ERR003",
-                    Message = "La pregunta enviada no corresponde al orden actual de tu sesión de trivia (mismatch de question_id)."
-                });
-            }
+                    return Task.FromResult(new SubmitAnswerBaseResponsePb
+                    {
+                        StatusCode = ErrorCode.ERR003,
+                        Message = "La pregunta enviada no corresponde al orden actual de tu sesión de trivia (mismatch de question_id)."
+                    });
+                }
 
-            // Validate selected_option_id belongs to the question
-            bool optionExists = mockQuestion.Options.Any(opt => string.Equals(opt.Id, request.SelectedOptionId, StringComparison.OrdinalIgnoreCase));
-            if (!optionExists)
-            {
-                return Task.FromResult(new SubmitAnswerBaseResponsePb
+                // Validate selected_option_id belongs to the question
+                bool optionExists = mockQuestion.Options.Any(opt => string.Equals(opt.Id, request.SelectedOptionId, StringComparison.OrdinalIgnoreCase));
+                if (!optionExists)
                 {
-                    StatusCode = "ERR008",
-                    Message = "La opción seleccionada es inválida o no corresponde a las opciones de la pregunta."
-                });
+                    return Task.FromResult(new SubmitAnswerBaseResponsePb
+                    {
+                        StatusCode = ErrorCode.ERR008,
+                        Message = "La opción seleccionada es inválida o no corresponde a las opciones de la pregunta."
+                    });
+                }
+
+                bool isCorrect = string.Equals(mockQuestion.CorrectOptionId, request.SelectedOptionId, StringComparison.OrdinalIgnoreCase);
+                int xpEarned = isCorrect ? 50 : 0;
+
+                if (isCorrect)
+                {
+                    session.CorrectAnswersCount++;
+                }
+
+                // Advance session question pointer
+                session.CurrentQuestionIndex++;
+                session.Touch();
+
+                bool isFinished = session.CurrentQuestionIndex >= totalQuestions;
+
+                // Update user progress (completed_questions field)
+                if (user.Departments.TryGetValue(session.DepartmentCode, out var deptProgress))
+                {
+                    deptProgress.CompletedQuestions = session.CurrentQuestionIndex;
+                }
+
+                var response = new SubmitAnswerResponsePb
+                {
+                    IsCorrect = isCorrect,
+                    CorrectOptionId = mockQuestion.CorrectOptionId,
+                    Explanation = mockQuestion.Explanation,
+                    IsSessionFinished = isFinished,
+                    XpEarned = xpEarned
+                };
+
+                var baseResponse = new SubmitAnswerBaseResponsePb
+                {
+                    Data = response,
+                    StatusCode = ErrorCode.SUC000,
+                    Message = isCorrect ? "Respuesta correcta registrada." : "Respuesta incorrecta registrada."
+                };
+
+                return Task.FromResult(baseResponse);
             }
-
-            bool isCorrect = string.Equals(mockQuestion.CorrectOptionId, request.SelectedOptionId, StringComparison.OrdinalIgnoreCase);
-            int xpEarned = isCorrect ? 50 : 0;
-
-            if (isCorrect)
-            {
-                session.CorrectAnswersCount++;
-            }
-
-            // Advance session question pointer
-            session.CurrentQuestionIndex++;
-            session.Touch();
-
-            bool isFinished = session.CurrentQuestionIndex >= totalQuestions;
-
-            // Update user progress (completed_questions field)
-            var user = TriviaMockDatabase.GetOrCreateUser(idUserProfile, documentNumber);
-            if (user.Departments.TryGetValue(session.DepartmentCode, out var deptProgress))
-            {
-                deptProgress.CompletedQuestions = session.CurrentQuestionIndex;
-            }
-
-            var response = new SubmitAnswerResponsePb
-            {
-                IsCorrect = isCorrect,
-                CorrectOptionId = mockQuestion.CorrectOptionId,
-                Explanation = mockQuestion.Explanation,
-                IsSessionFinished = isFinished,
-                XpEarned = xpEarned
-            };
-
-            var baseResponse = new SubmitAnswerBaseResponsePb
-            {
-                Data = response,
-                StatusCode = "SUC000",
-                Message = isCorrect ? "Respuesta correcta registrada." : "Respuesta incorrecta registrada."
-            };
-
-            return Task.FromResult(baseResponse);
         }
 
         public override Task<GetRewardsBaseResponsePb> GetRewards(GetRewardsRequestPb request, ServerCallContext context)
         {
-            var (idUserProfile, documentNumber, errorMsg) = ParseJwtFromMetadata(context.RequestHeaders);
+            var (idUserProfile, _, errorMsg) = ParseJwtFromMetadata(context.RequestHeaders);
             if (!string.IsNullOrEmpty(errorMsg))
             {
                 return Task.FromResult(new GetRewardsBaseResponsePb
                 {
-                    StatusCode = "ERR009",
+                    StatusCode = ErrorCode.ERR009,
                     Message = errorMsg
                 });
             }
@@ -430,7 +470,7 @@ namespace GrpcTest.Services
             {
                 return Task.FromResult(new GetRewardsBaseResponsePb
                 {
-                    StatusCode = "ERR002",
+                    StatusCode = ErrorCode.ERR002,
                     Message = "La sesión de trivia no fue encontrada."
                 });
             }
@@ -439,18 +479,18 @@ namespace GrpcTest.Services
             {
                 return Task.FromResult(new GetRewardsBaseResponsePb
                 {
-                    StatusCode = "ERR009",
+                    StatusCode = ErrorCode.ERR009,
                     Message = "La sesión de trivia especificada no pertenece al usuario autenticado."
                 });
             }
 
             // Check session timeout
-            if ((DateTime.UtcNow - session.LastAccessedUtc) > TriviaMockDatabase.SessionTimeout)
+            if ((BoliviaClock.Now - session.LastAccessedAt) > TriviaMockDatabase.SessionTimeout)
             {
                 TriviaMockDatabase.TerminateSession(session.SessionId);
                 return Task.FromResult(new GetRewardsBaseResponsePb
                 {
-                    StatusCode = "ERR005",
+                    StatusCode = ErrorCode.ERR005,
                     Message = "La sesión de trivia ha expirado por inactividad."
                 });
             }
@@ -460,12 +500,20 @@ namespace GrpcTest.Services
             {
                 return Task.FromResult(new GetRewardsBaseResponsePb
                 {
-                    StatusCode = "ERR004",
+                    StatusCode = ErrorCode.ERR004,
                     Message = $"La sesión de trivia aún no ha sido completada. Se completaron {session.CurrentQuestionIndex} de {totalQuestions} preguntas."
                 });
             }
 
-            var user = TriviaMockDatabase.GetOrCreateUser(idUserProfile, documentNumber);
+            var user = TriviaMockDatabase.GetOrCreateUser(idUserProfile);
+            if (user == null)
+            {
+                return Task.FromResult(new GetRewardsBaseResponsePb
+                {
+                    StatusCode = ErrorCode.ERR010,
+                    Message = $"No se encontró un usuario registrado con id_user_profile '{idUserProfile}'."
+                });
+            }
 
             int score = session.CorrectAnswersCount;
             int xpFromQuestions = score * 50;
@@ -527,7 +575,7 @@ namespace GrpcTest.Services
             var baseResponse = new GetRewardsBaseResponsePb
             {
                 Data = response,
-                StatusCode = "SUC000",
+                StatusCode = ErrorCode.SUC000,
                 Message = "Recompensas liquidadas y reclamadas con éxito."
             };
 

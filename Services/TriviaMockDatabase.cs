@@ -6,6 +6,16 @@ using GrpcTest;
 
 namespace GrpcTest.Services
 {
+    // Bolivia does not observe daylight saving time, so a fixed UTC-4 offset always holds.
+    // Centralizing "now" here keeps every timestamp in the mock expressed in local Bolivia
+    // time instead of UTC, matching how the real backend reports dates to clients.
+    public static class BoliviaClock
+    {
+        public static readonly TimeSpan Offset = TimeSpan.FromHours(-4);
+
+        public static DateTimeOffset Now => DateTimeOffset.UtcNow.ToOffset(Offset);
+    }
+
     public class UserState
     {
         public string IdUserProfile { get; set; } = string.Empty;
@@ -15,6 +25,7 @@ namespace GrpcTest.Services
         public int Age { get; set; } = 28;
         public string AccountOpeningBranch { get; set; } = "LP";
         public int WeeklyAttemptsLeft { get; set; } = 3;
+        public DateTimeOffset NextAttemptsResetAt { get; set; }
         public int TotalXp { get; set; } = 150;
         public int TotalYastaCoins { get; set; } = 30;
 
@@ -30,9 +41,13 @@ namespace GrpcTest.Services
         public int CurrentQuestionIndex { get; set; } = 0;
         public int CorrectAnswersCount { get; set; } = 0;
         public string LastQuestionId { get; set; } = string.Empty;
-        public DateTime LastAccessedUtc { get; set; } = DateTime.UtcNow;
+        public DateTimeOffset LastAccessedAt { get; set; } = BoliviaClock.Now;
 
-        public void Touch() => LastAccessedUtc = DateTime.UtcNow;
+        // Guards read-modify-write of this session's mutable counters (e.g. concurrent
+        // SubmitAnswer retries) so a double request can't advance/score a question twice.
+        public readonly object Lock = new();
+
+        public void Touch() => LastAccessedAt = BoliviaClock.Now;
     }
 
     public class MockQuestion
@@ -236,8 +251,8 @@ namespace GrpcTest.Services
             {
                 try
                 {
-                    var now = DateTime.UtcNow;
-                    var expired = Sessions.Where(kv => (now - kv.Value.LastAccessedUtc) > SessionTimeout)
+                    var now = BoliviaClock.Now;
+                    var expired = Sessions.Where(kv => (now - kv.Value.LastAccessedAt) > SessionTimeout)
                                           .Select(kv => kv.Key)
                                           .ToList();
                     foreach (var id in expired)
@@ -254,11 +269,47 @@ namespace GrpcTest.Services
             }, null, SessionTimeout, SessionTimeout);
         }
 
-        public static UserState GetOrCreateUser(string idUserProfile, string documentNumber)
+        // Maximum trivia attempts a user gets per week before NextAttemptsResetAt.
+        public const int WeeklyAttemptsMax = 3;
+
+        // Computes the next Monday 00:00:00 in Bolivia local time — used both to seed a new
+        // user's quota window and to recompute it once the current window has elapsed.
+        public static DateTimeOffset ComputeNextWeeklyResetAt()
         {
-            if (string.IsNullOrEmpty(idUserProfile))
+            var now = BoliviaClock.Now;
+            int daysUntilMonday = ((int)DayOfWeek.Monday - (int)now.DayOfWeek + 7) % 7;
+            if (daysUntilMonday == 0) daysUntilMonday = 7;
+            var nextMonday = now.Date.AddDays(daysUntilMonday);
+            return new DateTimeOffset(nextMonday, BoliviaClock.Offset);
+        }
+
+        // Lazily resets the weekly quota once its window has elapsed. There's no persistence
+        // or cron here, so the reset is computed on read/write access instead — the same
+        // "check on access" pattern a real backend would use for a per-user counter.
+        public static void EnsureWeeklyAttemptsFresh(UserState user)
+        {
+            if (BoliviaClock.Now >= user.NextAttemptsResetAt)
             {
-                idUserProfile = "guest_user";
+                user.WeeklyAttemptsLeft = WeeklyAttemptsMax;
+                user.NextAttemptsResetAt = ComputeNextWeeklyResetAt();
+            }
+        }
+
+        // Only these two identities exist in the mock "database" — mirrors a real backend
+        // where id_user_profile must resolve to an actual registered account.
+        private sealed record UserSeed(string DocumentNumber, string Name, string Gender, int Age);
+
+        private static readonly Dictionary<string, UserSeed> ValidUsers = new()
+        {
+            { "1", new UserSeed("123456", "Usuario 1", "male", 28) },
+            { "2", new UserSeed("654321", "Usuario 2", "female", 34) }
+        };
+
+        public static UserState? GetOrCreateUser(string idUserProfile)
+        {
+            if (!ValidUsers.TryGetValue(idUserProfile, out var seed))
+            {
+                return null;
             }
 
             return Users.GetOrAdd(idUserProfile, id =>
@@ -266,12 +317,13 @@ namespace GrpcTest.Services
                 var state = new UserState
                 {
                     IdUserProfile = id,
-                    DocumentNumber = string.IsNullOrEmpty(documentNumber) ? "7654321-LP" : documentNumber,
-                    Name = id == "guest_user" ? "Invitado" : "Usuario " + id.Replace("prof_", ""),
-                    Gender = id.EndsWith("2") || id.EndsWith("4") || id.EndsWith("6") || id.EndsWith("8") ? "female" : "male",
-                    Age = 25 + (Math.Abs(id.GetHashCode()) % 25),
+                    DocumentNumber = seed.DocumentNumber,
+                    Name = seed.Name,
+                    Gender = seed.Gender,
+                    Age = seed.Age,
                     AccountOpeningBranch = "LP",
-                    WeeklyAttemptsLeft = 3,
+                    WeeklyAttemptsLeft = WeeklyAttemptsMax,
+                    NextAttemptsResetAt = ComputeNextWeeklyResetAt(),
                     TotalXp = 250,
                     TotalYastaCoins = 50
                 };
