@@ -263,7 +263,7 @@ namespace GrpcTest.Services
                 });
             }
 
-            var mockQuestion = TriviaMockDatabase.GetQuestionByIndex(session.CurrentQuestionIndex);
+            var mockQuestion = TriviaMockDatabase.GetQuestionForSession(session, session.CurrentQuestionIndex);
             if (mockQuestion == null)
             {
                 return Task.FromResult(new GetCurrentQuestionBaseResponsePb
@@ -378,7 +378,7 @@ namespace GrpcTest.Services
                     });
                 }
 
-                var mockQuestion = TriviaMockDatabase.GetQuestionByIndex(session.CurrentQuestionIndex);
+                var mockQuestion = TriviaMockDatabase.GetQuestionForSession(session, session.CurrentQuestionIndex);
                 if (mockQuestion == null)
                 {
                     return Task.FromResult(new SubmitAnswerBaseResponsePb
