@@ -5,28 +5,25 @@ namespace GrpcTest.Services
 {
     public class TriviaService : GrpcTest.TriviaService.TriviaServiceBase
     {
-        // Helper method to base64-decode the JWT and extract id_user_profile and document_number
-        private (string idUserProfile, string documentNumber, string errorMsg) ParseJwtFromMetadata(Metadata metadata)
+        // Only validates presence of the token and of the id_user_profile claim.
+        // Format/signature/expiration are the gateway's responsibility, not ours.
+        private (string idUserProfile, string documentNumber, string errorCode, string errorMsg) ParseJwtFromMetadata(Metadata metadata)
         {
             var authHeader = metadata.FirstOrDefault(m => string.Equals(m.Key, "authorization", StringComparison.OrdinalIgnoreCase));
             if (authHeader == null || string.IsNullOrEmpty(authHeader.Value))
             {
-                return (string.Empty, string.Empty, "No autenticado. Token de autenticación no proporcionado.");
+                return (string.Empty, string.Empty, ErrorCode.ERR009, ErrorMessage.ERR009);
             }
 
             var val = authHeader.Value;
-            if (!val.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
-            {
-                return (string.Empty, string.Empty, "No autenticado. Formato de token inválido (debe ser 'Bearer <jwt>').");
-            }
+            var token = val.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase) ? val.Substring(7).Trim() : val.Trim();
 
-            var token = val.Substring(7).Trim();
             try
             {
                 var parts = token.Split('.');
                 if (parts.Length < 2)
                 {
-                    return (string.Empty, string.Empty, "No autenticado. Token JWT malformado.");
+                    return (string.Empty, string.Empty, ErrorCode.ERR011, ErrorMessage.ERR011);
                 }
 
                 var payload = parts[1];
@@ -42,17 +39,6 @@ namespace GrpcTest.Services
 
                 using var doc = System.Text.Json.JsonDocument.Parse(jsonStr);
                 var root = doc.RootElement;
-
-                // Validate expiration claim "exp" if present
-                if (root.TryGetProperty("exp", out var expProp))
-                {
-                    long expSeconds = expProp.GetInt64();
-                    var expTime = DateTimeOffset.FromUnixTimeSeconds(expSeconds);
-                    if (expTime < BoliviaClock.Now)
-                    {
-                        return (string.Empty, string.Empty, "No autenticado. El token de autenticación ha expirado.");
-                    }
-                }
 
                 string idUserProfile = string.Empty;
                 if (root.TryGetProperty("id_user_profile", out var idProp))
@@ -76,25 +62,25 @@ namespace GrpcTest.Services
 
                 if (string.IsNullOrEmpty(idUserProfile))
                 {
-                    return (string.Empty, string.Empty, "No autenticado. El claim 'id_user_profile' no se encuentra en el token.");
+                    return (string.Empty, string.Empty, ErrorCode.ERR011, ErrorMessage.ERR011);
                 }
 
-                return (idUserProfile, documentNumber, string.Empty);
+                return (idUserProfile, documentNumber, string.Empty, string.Empty);
             }
-            catch (Exception ex)
+            catch (Exception)
             {
-                return (string.Empty, string.Empty, $"No autenticado. Error al descifrar el token: {ex.Message}");
+                return (string.Empty, string.Empty, ErrorCode.ERR011, ErrorMessage.ERR011);
             }
         }
 
         public override Task<GetProfileBaseResponsePb> GetProfile(GetProfileRequestPb request, ServerCallContext context)
         {
-            var (idUserProfile, _, errorMsg) = ParseJwtFromMetadata(context.RequestHeaders);
-            if (!string.IsNullOrEmpty(errorMsg))
+            var (idUserProfile, _, errorCode, errorMsg) = ParseJwtFromMetadata(context.RequestHeaders);
+            if (!string.IsNullOrEmpty(errorCode))
             {
                 return Task.FromResult(new GetProfileBaseResponsePb
                 {
-                    StatusCode = ErrorCode.ERR009,
+                    StatusCode = errorCode,
                     Message = errorMsg
                 });
             }
@@ -105,12 +91,12 @@ namespace GrpcTest.Services
                 return Task.FromResult(new GetProfileBaseResponsePb
                 {
                     StatusCode = ErrorCode.ERR010,
-                    Message = $"No se encontró un usuario registrado con id_user_profile '{idUserProfile}'."
+                    Message = string.Format(ErrorMessage.ERR010, idUserProfile)
                 });
             }
 
             TriviaMockDatabase.EnsureWeeklyAttemptsFresh(user);
-            string nextResetDate = user.NextAttemptsResetAt.ToString("yyyy-MM-ddTHH:mm:sszzz");
+            string nextResetDate = user.NextAttemptsResetAt.ToString("dd/MM/yyyy");
 
             var response = new GetProfileResponsePb
             {
@@ -140,8 +126,7 @@ namespace GrpcTest.Services
             var baseResponse = new GetProfileBaseResponsePb
             {
                 Data = response,
-                StatusCode = ErrorCode.SUC000,
-                Message = "Perfil recuperado con éxito."
+                StatusCode = ErrorCode.SUC000
             };
 
             return Task.FromResult(baseResponse);
@@ -149,12 +134,12 @@ namespace GrpcTest.Services
 
         public override Task<GetCurrentQuestionBaseResponsePb> GetCurrentQuestion(GetCurrentQuestionRequestPb request, ServerCallContext context)
         {
-            var (idUserProfile, _, errorMsg) = ParseJwtFromMetadata(context.RequestHeaders);
-            if (!string.IsNullOrEmpty(errorMsg))
+            var (idUserProfile, _, errorCode, errorMsg) = ParseJwtFromMetadata(context.RequestHeaders);
+            if (!string.IsNullOrEmpty(errorCode))
             {
                 return Task.FromResult(new GetCurrentQuestionBaseResponsePb
                 {
-                    StatusCode = ErrorCode.ERR009,
+                    StatusCode = errorCode,
                     Message = errorMsg
                 });
             }
@@ -165,7 +150,7 @@ namespace GrpcTest.Services
                 return Task.FromResult(new GetCurrentQuestionBaseResponsePb
                 {
                     StatusCode = ErrorCode.ERR010,
-                    Message = $"No se encontró un usuario registrado con id_user_profile '{idUserProfile}'."
+                    Message = string.Format(ErrorMessage.ERR010, idUserProfile)
                 });
             }
 
@@ -181,7 +166,7 @@ namespace GrpcTest.Services
                     return Task.FromResult(new GetCurrentQuestionBaseResponsePb
                     {
                         StatusCode = ErrorCode.ERR007,
-                        Message = "El departamento seleccionado está bloqueado. Debes completar primero la trivia de tu departamento de apertura."
+                        Message = ErrorMessage.ERR007
                     });
                 }
             }
@@ -189,8 +174,8 @@ namespace GrpcTest.Services
             {
                 return Task.FromResult(new GetCurrentQuestionBaseResponsePb
                 {
-                    StatusCode = ErrorCode.ERR007,
-                    Message = $"El código de departamento '{deptCode}' no es válido."
+                    StatusCode = ErrorCode.ERR013,
+                    Message = string.Format(ErrorMessage.ERR013, deptCode)
                 });
             }
 
@@ -204,23 +189,23 @@ namespace GrpcTest.Services
                     return Task.FromResult(new GetCurrentQuestionBaseResponsePb
                     {
                         StatusCode = ErrorCode.ERR002,
-                        Message = "La sesión de trivia no fue encontrada o ha expirado."
+                        Message = ErrorMessage.ERR002
                     });
                 }
                 if (session.IdUserProfile != idUserProfile)
                 {
                     return Task.FromResult(new GetCurrentQuestionBaseResponsePb
                     {
-                        StatusCode = ErrorCode.ERR009,
-                        Message = "El token de autenticación no coincide con el creador de la sesión."
+                        StatusCode = ErrorCode.ERR015,
+                        Message = ErrorMessage.ERR015
                     });
                 }
                 if (!string.Equals(session.DepartmentCode, deptCode, StringComparison.OrdinalIgnoreCase))
                 {
                     return Task.FromResult(new GetCurrentQuestionBaseResponsePb
                     {
-                        StatusCode = ErrorCode.ERR007,
-                        Message = $"El department_code '{deptCode}' no corresponde al departamento de la sesión de trivia especificada ('{session.DepartmentCode}')."
+                        StatusCode = ErrorCode.ERR014,
+                        Message = string.Format(ErrorMessage.ERR014, deptCode, session.DepartmentCode)
                     });
                 }
             }
@@ -237,7 +222,7 @@ namespace GrpcTest.Services
                     return Task.FromResult(new GetCurrentQuestionBaseResponsePb
                     {
                         StatusCode = ErrorCode.ERR006,
-                        Message = "Has agotado tus intentos semanales permitidos para jugar trivias."
+                        Message = ErrorMessage.ERR006
                     });
                 }
 
@@ -259,7 +244,7 @@ namespace GrpcTest.Services
                 return Task.FromResult(new GetCurrentQuestionBaseResponsePb
                 {
                     StatusCode = ErrorCode.ERR001,
-                    Message = "La sesión ya ha finalizado. Por favor reclame sus recompensas."
+                    Message = ErrorMessage.ERR001
                 });
             }
 
@@ -268,8 +253,8 @@ namespace GrpcTest.Services
             {
                 return Task.FromResult(new GetCurrentQuestionBaseResponsePb
                 {
-                    StatusCode = ErrorCode.ERR002,
-                    Message = "La pregunta solicitada no se pudo cargar."
+                    StatusCode = ErrorCode.ERR012,
+                    Message = ErrorMessage.ERR012
                 });
             }
 
@@ -303,8 +288,7 @@ namespace GrpcTest.Services
             var baseResponse = new GetCurrentQuestionBaseResponsePb
             {
                 Data = response,
-                StatusCode = ErrorCode.SUC000,
-                Message = "Pregunta recuperada con éxito."
+                StatusCode = ErrorCode.SUC000
             };
 
             return Task.FromResult(baseResponse);
@@ -312,12 +296,12 @@ namespace GrpcTest.Services
 
         public override Task<SubmitAnswerBaseResponsePb> SubmitAnswer(SubmitAnswerRequestPb request, ServerCallContext context)
         {
-            var (idUserProfile, _, errorMsg) = ParseJwtFromMetadata(context.RequestHeaders);
-            if (!string.IsNullOrEmpty(errorMsg))
+            var (idUserProfile, _, errorCode, errorMsg) = ParseJwtFromMetadata(context.RequestHeaders);
+            if (!string.IsNullOrEmpty(errorCode))
             {
                 return Task.FromResult(new SubmitAnswerBaseResponsePb
                 {
-                    StatusCode = ErrorCode.ERR009,
+                    StatusCode = errorCode,
                     Message = errorMsg
                 });
             }
@@ -328,7 +312,7 @@ namespace GrpcTest.Services
                 return Task.FromResult(new SubmitAnswerBaseResponsePb
                 {
                     StatusCode = ErrorCode.ERR002,
-                    Message = "La sesión de trivia no fue encontrada."
+                    Message = ErrorMessage.ERR002
                 });
             }
 
@@ -336,8 +320,8 @@ namespace GrpcTest.Services
             {
                 return Task.FromResult(new SubmitAnswerBaseResponsePb
                 {
-                    StatusCode = ErrorCode.ERR009,
-                    Message = "La sesión de trivia especificada no pertenece al usuario autenticado."
+                    StatusCode = ErrorCode.ERR015,
+                    Message = ErrorMessage.ERR015
                 });
             }
 
@@ -347,7 +331,7 @@ namespace GrpcTest.Services
                 return Task.FromResult(new SubmitAnswerBaseResponsePb
                 {
                     StatusCode = ErrorCode.ERR010,
-                    Message = $"No se encontró un usuario registrado con id_user_profile '{idUserProfile}'."
+                    Message = string.Format(ErrorMessage.ERR010, idUserProfile)
                 });
             }
 
@@ -358,7 +342,7 @@ namespace GrpcTest.Services
                 return Task.FromResult(new SubmitAnswerBaseResponsePb
                 {
                     StatusCode = ErrorCode.ERR005,
-                    Message = "La sesión de trivia ha expirado por inactividad."
+                    Message = ErrorMessage.ERR005
                 });
             }
 
@@ -374,7 +358,7 @@ namespace GrpcTest.Services
                     return Task.FromResult(new SubmitAnswerBaseResponsePb
                     {
                         StatusCode = ErrorCode.ERR001,
-                        Message = "La sesión ya ha finalizado. Por favor reclame sus recompensas."
+                        Message = ErrorMessage.ERR001
                     });
                 }
 
@@ -383,8 +367,8 @@ namespace GrpcTest.Services
                 {
                     return Task.FromResult(new SubmitAnswerBaseResponsePb
                     {
-                        StatusCode = ErrorCode.ERR002,
-                        Message = "No se pudo recuperar la pregunta en curso."
+                        StatusCode = ErrorCode.ERR012,
+                        Message = ErrorMessage.ERR012
                     });
                 }
 
@@ -394,7 +378,7 @@ namespace GrpcTest.Services
                     return Task.FromResult(new SubmitAnswerBaseResponsePb
                     {
                         StatusCode = ErrorCode.ERR003,
-                        Message = "La pregunta enviada no corresponde al orden actual de tu sesión de trivia (mismatch de question_id)."
+                        Message = ErrorMessage.ERR003
                     });
                 }
 
@@ -405,7 +389,7 @@ namespace GrpcTest.Services
                     return Task.FromResult(new SubmitAnswerBaseResponsePb
                     {
                         StatusCode = ErrorCode.ERR008,
-                        Message = "La opción seleccionada es inválida o no corresponde a las opciones de la pregunta."
+                        Message = ErrorMessage.ERR008
                     });
                 }
 
@@ -441,8 +425,7 @@ namespace GrpcTest.Services
                 var baseResponse = new SubmitAnswerBaseResponsePb
                 {
                     Data = response,
-                    StatusCode = ErrorCode.SUC000,
-                    Message = isCorrect ? "Respuesta correcta registrada." : "Respuesta incorrecta registrada."
+                    StatusCode = ErrorCode.SUC000
                 };
 
                 return Task.FromResult(baseResponse);
@@ -451,12 +434,12 @@ namespace GrpcTest.Services
 
         public override Task<GetRewardsBaseResponsePb> GetRewards(GetRewardsRequestPb request, ServerCallContext context)
         {
-            var (idUserProfile, _, errorMsg) = ParseJwtFromMetadata(context.RequestHeaders);
-            if (!string.IsNullOrEmpty(errorMsg))
+            var (idUserProfile, _, errorCode, errorMsg) = ParseJwtFromMetadata(context.RequestHeaders);
+            if (!string.IsNullOrEmpty(errorCode))
             {
                 return Task.FromResult(new GetRewardsBaseResponsePb
                 {
-                    StatusCode = ErrorCode.ERR009,
+                    StatusCode = errorCode,
                     Message = errorMsg
                 });
             }
@@ -467,7 +450,7 @@ namespace GrpcTest.Services
                 return Task.FromResult(new GetRewardsBaseResponsePb
                 {
                     StatusCode = ErrorCode.ERR002,
-                    Message = "La sesión de trivia no fue encontrada."
+                    Message = ErrorMessage.ERR002
                 });
             }
 
@@ -475,8 +458,8 @@ namespace GrpcTest.Services
             {
                 return Task.FromResult(new GetRewardsBaseResponsePb
                 {
-                    StatusCode = ErrorCode.ERR009,
-                    Message = "La sesión de trivia especificada no pertenece al usuario autenticado."
+                    StatusCode = ErrorCode.ERR015,
+                    Message = ErrorMessage.ERR015
                 });
             }
 
@@ -487,7 +470,7 @@ namespace GrpcTest.Services
                 return Task.FromResult(new GetRewardsBaseResponsePb
                 {
                     StatusCode = ErrorCode.ERR005,
-                    Message = "La sesión de trivia ha expirado por inactividad."
+                    Message = ErrorMessage.ERR005
                 });
             }
 
@@ -497,7 +480,7 @@ namespace GrpcTest.Services
                 return Task.FromResult(new GetRewardsBaseResponsePb
                 {
                     StatusCode = ErrorCode.ERR004,
-                    Message = $"La sesión de trivia aún no ha sido completada. Se completaron {session.CurrentQuestionIndex} de {totalQuestions} preguntas."
+                    Message = string.Format(ErrorMessage.ERR004, session.CurrentQuestionIndex, totalQuestions)
                 });
             }
 
@@ -507,7 +490,7 @@ namespace GrpcTest.Services
                 return Task.FromResult(new GetRewardsBaseResponsePb
                 {
                     StatusCode = ErrorCode.ERR010,
-                    Message = $"No se encontró un usuario registrado con id_user_profile '{idUserProfile}'."
+                    Message = string.Format(ErrorMessage.ERR010, idUserProfile)
                 });
             }
 
@@ -571,8 +554,7 @@ namespace GrpcTest.Services
             var baseResponse = new GetRewardsBaseResponsePb
             {
                 Data = response,
-                StatusCode = ErrorCode.SUC000,
-                Message = "Recompensas liquidadas y reclamadas con éxito."
+                StatusCode = ErrorCode.SUC000
             };
 
             return Task.FromResult(baseResponse);

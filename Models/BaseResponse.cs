@@ -19,7 +19,7 @@ namespace GrpcTest.Models
 
         public static BaseResponse<T> Error(string code, string message) => CreateBaseResponse(code, message: message);
 
-        public static BaseResponse<T> Exception(Exception exception) => CreateBaseResponse(ErrorCode.ERR001, exception: exception, message: ErrorMessage.ERR001);
+        public static BaseResponse<T> Exception(Exception exception) => CreateBaseResponse(ErrorCode.ERR001, exception: exception, message: ErrorMessage.ERR001_LEGACY_EXCEPTION);
 
         private static BaseResponse<T> CreateBaseResponse(string code, string message, T? data = default!, Exception? exception = null, List<ErrorModel>? errors = null)
         {
