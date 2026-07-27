@@ -19,5 +19,10 @@ namespace GrpcTest.Errors
         public const string ERR013 = nameof(ERR013); // Invalid department code
         public const string ERR014 = nameof(ERR014); // department_code does not match the session's department
         public const string ERR015 = nameof(ERR015); // Session does not belong to the authenticated user
+        public const string ERR016 = nameof(ERR016); // Invalid category code
+        public const string ERR017 = nameof(ERR017); // Invalid topic id
+        public const string ERR018 = nameof(ERR018); // topic_id does not match the session's topic
+        public const string ERR019 = nameof(ERR019); // Topic has no learning resource configured
+        public const string ERR020 = nameof(ERR020); // topic_id is required to start a new trivia session
     }
 }

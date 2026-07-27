@@ -4,9 +4,11 @@ import "base_response.proto";
 option csharp_namespace = "GrpcTest";
 
 package trivia;
-
 service TriviaService {
   rpc GetProfile (GetProfileRequestPb) returns (GetProfileBaseResponsePb);
+  rpc GetCategories (GetCategoriesRequestPb) returns (GetCategoriesBaseResponsePb);
+  rpc GetTopics (GetTopicsRequestPb) returns (GetTopicsBaseResponsePb);
+  rpc GetTopicResource (GetTopicResourceRequestPb) returns (GetTopicResourceBaseResponsePb);
   rpc GetCurrentQuestion (GetCurrentQuestionRequestPb) returns (GetCurrentQuestionBaseResponsePb);
   rpc SubmitAnswer (SubmitAnswerRequestPb) returns (SubmitAnswerBaseResponsePb);
   rpc GetRewards (GetRewardsRequestPb) returns (GetRewardsBaseResponsePb);
@@ -17,11 +19,11 @@ service TriviaService {
 message GetProfileRequestPb {}
 
 message GetProfileBaseResponsePb{
-	string message = 1;
-	GetProfileResponsePb data = 2;
-	repeated base_response.ErrorPb errors = 3;
-	optional base_response.ExceptionDetailPb exception = 4;
-	optional string status_code = 5;
+  string message = 1;
+  GetProfileResponsePb data = 2;
+  repeated base_response.ErrorPb errors = 3;
+  optional base_response.ExceptionDetailPb exception = 4;
+  optional string status_code = 5;
 }
 
 message GetProfileResponsePb {
@@ -29,8 +31,6 @@ message GetProfileResponsePb {
   UserQuotaPb quota = 2;
   GlobalProgressPb global_progress = 3;
 }
-
-
 
 message UserProfilePb {
   string id = 1;
@@ -49,9 +49,12 @@ message UserQuotaPb {
 message DepartmentProgressPb {
   string code = 1;
   string name = 2;
+  // "locked" | "unlocked" | "in_progress" | "completed"
   string status = 3;
   int32 completed_questions = 4;
   int32 total_questions = 5;
+  int32 completed_topics = 6;
+  int32 total_topics = 7;
 }
 
 message GlobalProgressPb {
@@ -60,11 +63,138 @@ message GlobalProgressPb {
   repeated DepartmentProgressPb departments = 3;
 }
 
+// ---- GetCategories ----
+
+message GetCategoriesRequestPb {
+  string department_code = 1;
+}
+
+message CategoryPb {
+  string code = 1;
+  string label = 2;
+  string icon_key = 3;
+  string description = 4;
+  int32 total_topics = 5;
+  int32 completed_topics = 6;
+  // "not_started" | "in_progress" | "completed"
+  string status = 7;
+}
+
+message DailyChallengePb {
+  string date = 1;
+  string topic_id = 2;
+  string topic_title = 3;
+  string category_code = 4;
+  string category_label = 5;
+  string icon_key = 6;
+  string title = 7;
+  string description = 8;
+  int32 total_questions = 9;
+  // "not_started" | "in_progress" | "completed", referido solo al día de hoy:
+  // "completed" = reclamó recompensas de este tema hoy. Si lo completó en otra fecha
+  // vuelve a llegar "not_started". best_score y times_completed sí son históricos.
+  string status = 10;
+  int32 best_score = 11;
+  int32 times_completed = 12;
+  // "image"
+  string resource_type = 13;
+}
+
+message GetCategoriesBaseResponsePb{
+  string message = 1;
+  GetCategoriesResponsePb data = 2;
+  repeated base_response.ErrorPb errors = 3;
+  optional base_response.ExceptionDetailPb exception = 4;
+  optional string status_code = 5;
+}
+
+message GetCategoriesResponsePb {
+  string department_code = 1;
+  string department_name = 2;
+  // "locked" | "unlocked" | "in_progress" | "completed"
+  string department_status = 3;
+  repeated CategoryPb categories = 4;
+  DailyChallengePb daily_challenge = 5;
+}
+
+// ---- GetTopics ----
+
+message GetTopicsRequestPb {
+  string department_code = 1;
+  string category_code = 2;
+}
+
+message TopicPb {
+  string id = 1;
+  string title = 2;
+  string description = 3;
+  string icon_key = 4;
+  string category_code = 5;
+  int32 total_questions = 6;
+  // "not_started" | "in_progress" | "completed"
+  string status = 7;
+  int32 best_score = 8;
+  int32 times_completed = 9;
+  // "image"
+  string resource_type = 10;
+  bool is_daily_challenge = 11;
+}
+
+message GetTopicsBaseResponsePb{
+  string message = 1;
+  GetTopicsResponsePb data = 2;
+  repeated base_response.ErrorPb errors = 3;
+  optional base_response.ExceptionDetailPb exception = 4;
+  optional string status_code = 5;
+}
+
+message GetTopicsResponsePb {
+  string department_code = 1;
+  string category_code = 2;
+  string category_label = 3;
+  string icon_key = 4;
+  repeated TopicPb topics = 5;
+}
+
+// ---- GetTopicResource ----
+
+message GetTopicResourceRequestPb {
+  string topic_id = 1;
+}
+
+message TopicResourcePb {
+  // "image"
+  string type = 1;
+  string title = 2;
+  string description = 3;
+  string url = 4;
+}
+
+message GetTopicResourceBaseResponsePb{
+  string message = 1;
+  GetTopicResourceResponsePb data = 2;
+  repeated base_response.ErrorPb errors = 3;
+  optional base_response.ExceptionDetailPb exception = 4;
+  optional string status_code = 5;
+}
+
+message GetTopicResourceResponsePb {
+  string topic_id = 1;
+  string topic_title = 2;
+  string category_code = 3;
+  string category_label = 4;
+  TopicResourcePb resource = 5;
+  int32 total_questions = 6;
+  bool is_daily_challenge = 7;
+}
+
 // ---- GetCurrentQuestion ----
 
 message GetCurrentQuestionRequestPb {
   string department_code = 1;
   string trivia_session_id = 2;
+  // Requerido para iniciar una nueva sesión. Opcional si se envía trivia_session_id.
+  string topic_id = 3;
 }
 
 message QuestionOptionPb {
@@ -79,6 +209,8 @@ message TriviaQuestionPb {
   repeated QuestionOptionPb options = 4;
   string category_label = 5;
   string category_icon_key = 6;
+  string topic_id = 7;
+  string topic_title = 8;
 }
 
 message GetCurrentQuestionBaseResponsePb{
@@ -95,6 +227,10 @@ message GetCurrentQuestionResponsePb {
   int32 current_question_number = 3;
   int32 total_questions = 4;
   TriviaQuestionPb question = 5;
+  string topic_id = 6;
+  string topic_title = 7;
+  string category_code = 8;
+  string category_label = 9;
 }
 
 // ---- SubmitAnswer ----
@@ -119,6 +255,9 @@ message SubmitAnswerResponsePb {
   string explanation = 3;
   bool is_session_finished = 4;
   int32 xp_earned = 5;
+  int32 current_question_number = 6;
+  int32 total_questions = 7;
+  int32 correct_answers_so_far = 8;
 }
 
 // ---- GetRewards ----
@@ -152,6 +291,16 @@ message GetRewardsResponsePb {
   RewardsEarnedPb rewards_earned = 4;
   string message = 5;
   int32 weekly_attempts_left = 6;
+  // "locked" | "unlocked" | "in_progress" | "completed"
   string department_status = 7;
   repeated string unlocked_department_codes = 8;
+  string topic_id = 9;
+  string topic_title = 10;
+  string category_code = 11;
+  string category_label = 12;
+  // "completed" tras reclamar recompensas.
+  string topic_status = 13;
+  int32 best_score = 14;
+  int32 completed_topics_in_department = 15;
+  int32 total_topics_in_department = 16;
 }

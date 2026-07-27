@@ -73,6 +73,80 @@ namespace GrpcTest.Services
             }
         }
 
+        // Resolución común a casi todos los métodos: token -> usuario -> departamento habilitado.
+        // Si el department_code viene vacío se asume la sucursal de apertura del usuario.
+        private (UserState? user, string departmentCode, string errorCode, string errorMsg) ResolveUserAndDepartment(
+            Metadata metadata, string requestedDepartmentCode, bool requireUnlocked = true)
+        {
+            var (idUserProfile, _, errorCode, errorMsg) = ParseJwtFromMetadata(metadata);
+            if (!string.IsNullOrEmpty(errorCode))
+            {
+                return (null, string.Empty, errorCode, errorMsg);
+            }
+
+            var user = TriviaMockDatabase.GetOrCreateUser(idUserProfile);
+            if (user == null)
+            {
+                return (null, string.Empty, ErrorCode.ERR010, ErrorMessage.ERR010);
+            }
+
+            TriviaMockDatabase.EnsureWeeklyAttemptsFresh(user);
+
+            string deptCode = string.IsNullOrWhiteSpace(requestedDepartmentCode)
+                ? user.AccountOpeningBranch
+                : requestedDepartmentCode.Trim().ToUpper();
+
+            if (!user.Departments.TryGetValue(deptCode, out var deptProgress))
+            {
+                return (null, string.Empty, ErrorCode.ERR013, ErrorMessage.ERR013);
+            }
+
+            if (requireUnlocked && deptProgress.Status == TriviaMockDatabase.DeptLocked)
+            {
+                return (null, string.Empty, ErrorCode.ERR007, ErrorMessage.ERR007);
+            }
+
+            return (user, deptCode, string.Empty, string.Empty);
+        }
+
+        // Estado agregado de una categoría dentro de un departamento, derivado del progreso
+        // por tema del usuario.
+        private static (string status, int completedTopics) BuildCategoryStatus(UserState user, string departmentCode, TriviaCategory category)
+        {
+            int completed = TriviaMockDatabase.CountCompletedTopics(user, departmentCode, category.Code);
+            if (completed >= category.Topics.Count)
+            {
+                return (TriviaMockDatabase.TopicCompleted, completed);
+            }
+
+            bool started = category.Topics.Any(t =>
+            {
+                var progress = TriviaMockDatabase.FindTopicProgress(user, departmentCode, t.Id);
+                return progress != null && progress.Status != TriviaMockDatabase.TopicNotStarted;
+            });
+
+            return (started ? TriviaMockDatabase.TopicInProgress : TriviaMockDatabase.TopicNotStarted, completed);
+        }
+
+        // Estado del desafío diario referido a HOY, no al histórico del tema: completar este
+        // mismo tema hace tres semanas dejaría el status en "completed" para siempre y la app
+        // pintaría "ya hiciste el reto de hoy" sin que el usuario lo haya tocado.
+        private static string BuildDailyChallengeStatus(UserState user, string departmentCode, TriviaTopic topic)
+        {
+            var progress = TriviaMockDatabase.FindTopicProgress(user, departmentCode, topic.Id);
+            if (TriviaMockDatabase.WasCompletedToday(progress))
+            {
+                return TriviaMockDatabase.TopicCompleted;
+            }
+
+            if (TriviaMockDatabase.HasOpenSessionForTopic(user.IdUserProfile, departmentCode, topic.Id))
+            {
+                return TriviaMockDatabase.TopicInProgress;
+            }
+
+            return TriviaMockDatabase.TopicNotStarted;
+        }
+
         public override Task<GetProfileBaseResponsePb> GetProfile(GetProfileRequestPb request, ServerCallContext context)
         {
             var (idUserProfile, _, errorCode, errorMsg) = ParseJwtFromMetadata(context.RequestHeaders);
@@ -91,7 +165,7 @@ namespace GrpcTest.Services
                 return Task.FromResult(new GetProfileBaseResponsePb
                 {
                     StatusCode = ErrorCode.ERR010,
-                    Message = string.Format(ErrorMessage.ERR010, idUserProfile)
+                    Message = ErrorMessage.ERR010
                 });
             }
 
@@ -132,10 +206,196 @@ namespace GrpcTest.Services
             return Task.FromResult(baseResponse);
         }
 
+        // Pantalla 1: a partir del departamento, lista las categorías disponibles y el
+        // tema destacado del día.
+        public override Task<GetCategoriesBaseResponsePb> GetCategories(GetCategoriesRequestPb request, ServerCallContext context)
+        {
+            var (user, deptCode, errorCode, errorMsg) = ResolveUserAndDepartment(context.RequestHeaders, request.DepartmentCode);
+            if (user == null)
+            {
+                return Task.FromResult(new GetCategoriesBaseResponsePb
+                {
+                    StatusCode = errorCode,
+                    Message = errorMsg
+                });
+            }
+
+            var deptProgress = user.Departments[deptCode];
+
+            var response = new GetCategoriesResponsePb
+            {
+                DepartmentCode = deptCode,
+                DepartmentName = deptProgress.Name,
+                DepartmentStatus = deptProgress.Status
+            };
+
+            foreach (var category in TriviaCatalog.Categories)
+            {
+                var (status, completedTopics) = BuildCategoryStatus(user, deptCode, category);
+                response.Categories.Add(new CategoryPb
+                {
+                    Code = category.Code,
+                    Label = category.Label,
+                    IconKey = category.IconKey,
+                    Description = category.Description,
+                    TotalTopics = category.Topics.Count,
+                    CompletedTopics = completedTopics,
+                    Status = status
+                });
+            }
+
+            // El desafío diario apunta a un tema concreto: el cliente va directo a
+            // GetTopicResource(topic_id) y luego a la trivia, sin pasar por GetTopics.
+            var daily = TriviaCatalog.GetDailyChallengeTopic(BoliviaClock.Now);
+            var dailyProgress = TriviaMockDatabase.FindTopicProgress(user, deptCode, daily.Id);
+
+            response.DailyChallenge = new DailyChallengePb
+            {
+                Date = BoliviaClock.Now.ToString("dd/MM/yyyy"),
+                TopicId = daily.Id,
+                TopicTitle = daily.Title,
+                CategoryCode = daily.CategoryCode,
+                CategoryLabel = daily.CategoryLabel,
+                IconKey = daily.IconKey,
+                Title = $"Desafío diario: {daily.Title}",
+                Description = $"Hoy te retamos con {daily.Title} ({daily.CategoryLabel}). Revisa el recurso y demuestra lo que sabes.",
+                TotalQuestions = Math.Min(TriviaCatalog.QuestionsPerSession, daily.Questions.Count),
+                Status = BuildDailyChallengeStatus(user, deptCode, daily),
+                BestScore = dailyProgress?.BestScore ?? 0,
+                TimesCompleted = dailyProgress?.TimesCompleted ?? 0,
+                ResourceType = daily.Resource.Type
+            };
+
+            return Task.FromResult(new GetCategoriesBaseResponsePb
+            {
+                Data = response,
+                StatusCode = ErrorCode.SUC000
+            });
+        }
+
+        // Pantalla 2: temas de la categoría seleccionada. El desafío diario ya no pasa por
+        // aquí (va directo al recurso del tema); solo se marca el tema destacado del día.
+        public override Task<GetTopicsBaseResponsePb> GetTopics(GetTopicsRequestPb request, ServerCallContext context)
+        {
+            var (user, deptCode, errorCode, errorMsg) = ResolveUserAndDepartment(context.RequestHeaders, request.DepartmentCode);
+            if (user == null)
+            {
+                return Task.FromResult(new GetTopicsBaseResponsePb
+                {
+                    StatusCode = errorCode,
+                    Message = errorMsg
+                });
+            }
+
+            var category = TriviaCatalog.GetCategory(request.CategoryCode);
+            if (category == null)
+            {
+                return Task.FromResult(new GetTopicsBaseResponsePb
+                {
+                    StatusCode = ErrorCode.ERR016,
+                    Message = ErrorMessage.ERR016
+                });
+            }
+
+            var dailyTopic = TriviaCatalog.GetDailyChallengeTopic(BoliviaClock.Now);
+
+            var response = new GetTopicsResponsePb
+            {
+                DepartmentCode = deptCode,
+                CategoryCode = category.Code,
+                CategoryLabel = category.Label,
+                IconKey = category.IconKey
+            };
+
+            foreach (var topic in category.Topics)
+            {
+                var progress = TriviaMockDatabase.FindTopicProgress(user, deptCode, topic.Id);
+                response.Topics.Add(new TopicPb
+                {
+                    Id = topic.Id,
+                    Title = topic.Title,
+                    Description = topic.Description,
+                    IconKey = topic.IconKey,
+                    CategoryCode = category.Code,
+                    TotalQuestions = Math.Min(TriviaCatalog.QuestionsPerSession, topic.Questions.Count),
+                    Status = progress?.Status ?? TriviaMockDatabase.TopicNotStarted,
+                    BestScore = progress?.BestScore ?? 0,
+                    TimesCompleted = progress?.TimesCompleted ?? 0,
+                    ResourceType = topic.Resource.Type,
+                    IsDailyChallenge = string.Equals(topic.Id, dailyTopic.Id, StringComparison.OrdinalIgnoreCase)
+                });
+            }
+
+            return Task.FromResult(new GetTopicsBaseResponsePb
+            {
+                Data = response,
+                StatusCode = ErrorCode.SUC000
+            });
+        }
+
+        // Pantalla 3: único recurso de aprendizaje del tema (pdf, imagen o video), previo
+        // a iniciar la trivia. No consume intentos ni crea sesión.
+        public override Task<GetTopicResourceBaseResponsePb> GetTopicResource(GetTopicResourceRequestPb request, ServerCallContext context)
+        {
+            var (_, _, errorCode, errorMsg) = ParseJwtFromMetadata(context.RequestHeaders);
+            if (!string.IsNullOrEmpty(errorCode))
+            {
+                return Task.FromResult(new GetTopicResourceBaseResponsePb
+                {
+                    StatusCode = errorCode,
+                    Message = errorMsg
+                });
+            }
+
+            var topic = TriviaCatalog.GetTopic(request.TopicId);
+            if (topic == null)
+            {
+                return Task.FromResult(new GetTopicResourceBaseResponsePb
+                {
+                    StatusCode = ErrorCode.ERR017,
+                    Message = ErrorMessage.ERR017
+                });
+            }
+
+            if (string.IsNullOrWhiteSpace(topic.Resource.Url))
+            {
+                return Task.FromResult(new GetTopicResourceBaseResponsePb
+                {
+                    StatusCode = ErrorCode.ERR019,
+                    Message = ErrorMessage.ERR019
+                });
+            }
+
+            var response = new GetTopicResourceResponsePb
+            {
+                TopicId = topic.Id,
+                TopicTitle = topic.Title,
+                CategoryCode = topic.CategoryCode,
+                CategoryLabel = topic.CategoryLabel,
+                TotalQuestions = Math.Min(TriviaCatalog.QuestionsPerSession, topic.Questions.Count),
+                IsDailyChallenge = TriviaCatalog.IsDailyChallengeTopic(topic.Id, BoliviaClock.Now),
+                Resource = new TopicResourcePb
+                {
+                    Type = topic.Resource.Type,
+                    Title = topic.Resource.Title,
+                    Description = topic.Resource.Description,
+                    Url = topic.Resource.Url
+                }
+            };
+
+            return Task.FromResult(new GetTopicResourceBaseResponsePb
+            {
+                Data = response,
+                StatusCode = ErrorCode.SUC000
+            });
+        }
+
+        // Pantalla 4: banco de preguntas del tema. La sesión se crea aquí (y recién aquí se
+        // descuenta un intento semanal).
         public override Task<GetCurrentQuestionBaseResponsePb> GetCurrentQuestion(GetCurrentQuestionRequestPb request, ServerCallContext context)
         {
-            var (idUserProfile, _, errorCode, errorMsg) = ParseJwtFromMetadata(context.RequestHeaders);
-            if (!string.IsNullOrEmpty(errorCode))
+            var (user, deptCode, errorCode, errorMsg) = ResolveUserAndDepartment(context.RequestHeaders, request.DepartmentCode);
+            if (user == null)
             {
                 return Task.FromResult(new GetCurrentQuestionBaseResponsePb
                 {
@@ -144,43 +404,9 @@ namespace GrpcTest.Services
                 });
             }
 
-            var user = TriviaMockDatabase.GetOrCreateUser(idUserProfile);
-            if (user == null)
-            {
-                return Task.FromResult(new GetCurrentQuestionBaseResponsePb
-                {
-                    StatusCode = ErrorCode.ERR010,
-                    Message = string.Format(ErrorMessage.ERR010, idUserProfile)
-                });
-            }
-
-            TriviaMockDatabase.EnsureWeeklyAttemptsFresh(user);
-
-            string deptCode = string.IsNullOrWhiteSpace(request.DepartmentCode) ? user.AccountOpeningBranch : request.DepartmentCode.ToUpper();
-
-            // Verify department status
-            if (user.Departments.TryGetValue(deptCode, out var deptProgress))
-            {
-                if (deptProgress.Status == "locked")
-                {
-                    return Task.FromResult(new GetCurrentQuestionBaseResponsePb
-                    {
-                        StatusCode = ErrorCode.ERR007,
-                        Message = ErrorMessage.ERR007
-                    });
-                }
-            }
-            else
-            {
-                return Task.FromResult(new GetCurrentQuestionBaseResponsePb
-                {
-                    StatusCode = ErrorCode.ERR013,
-                    Message = string.Format(ErrorMessage.ERR013, deptCode)
-                });
-            }
-
-            // Retrieve session
+            TriviaTopic? topic = null;
             TriviaSessionState? session = null;
+
             if (!string.IsNullOrEmpty(request.TriviaSessionId))
             {
                 session = TriviaMockDatabase.GetSession(request.TriviaSessionId);
@@ -192,7 +418,7 @@ namespace GrpcTest.Services
                         Message = ErrorMessage.ERR002
                     });
                 }
-                if (session.IdUserProfile != idUserProfile)
+                if (session.IdUserProfile != user.IdUserProfile)
                 {
                     return Task.FromResult(new GetCurrentQuestionBaseResponsePb
                     {
@@ -205,13 +431,52 @@ namespace GrpcTest.Services
                     return Task.FromResult(new GetCurrentQuestionBaseResponsePb
                     {
                         StatusCode = ErrorCode.ERR014,
-                        Message = string.Format(ErrorMessage.ERR014, deptCode, session.DepartmentCode)
+                        Message = ErrorMessage.ERR014
                     });
                 }
+                if (!string.IsNullOrWhiteSpace(request.TopicId) &&
+                    !string.Equals(session.TopicId, request.TopicId.Trim(), StringComparison.OrdinalIgnoreCase))
+                {
+                    return Task.FromResult(new GetCurrentQuestionBaseResponsePb
+                    {
+                        StatusCode = ErrorCode.ERR018,
+                        Message = ErrorMessage.ERR018
+                    });
+                }
+
+                topic = TriviaCatalog.GetTopic(session.TopicId);
             }
             else
             {
-                session = TriviaMockDatabase.GetActiveSessionForDepartment(idUserProfile, deptCode);
+                if (string.IsNullOrWhiteSpace(request.TopicId))
+                {
+                    return Task.FromResult(new GetCurrentQuestionBaseResponsePb
+                    {
+                        StatusCode = ErrorCode.ERR020,
+                        Message = ErrorMessage.ERR020
+                    });
+                }
+
+                topic = TriviaCatalog.GetTopic(request.TopicId);
+                if (topic == null)
+                {
+                    return Task.FromResult(new GetCurrentQuestionBaseResponsePb
+                    {
+                        StatusCode = ErrorCode.ERR017,
+                        Message = ErrorMessage.ERR017
+                    });
+                }
+
+                session = TriviaMockDatabase.GetActiveSessionForTopic(user.IdUserProfile, deptCode, topic.Id);
+            }
+
+            if (topic == null)
+            {
+                return Task.FromResult(new GetCurrentQuestionBaseResponsePb
+                {
+                    StatusCode = ErrorCode.ERR012,
+                    Message = ErrorMessage.ERR012
+                });
             }
 
             // If starting a new session, verify attempts and deduct
@@ -228,17 +493,20 @@ namespace GrpcTest.Services
 
                 user.WeeklyAttemptsLeft--;
 
-                session = TriviaMockDatabase.StartNewSession(idUserProfile, deptCode);
+                session = TriviaMockDatabase.StartNewSession(user.IdUserProfile, deptCode, topic);
 
-                if (deptProgress.Status == "unlocked")
+                var topicProgress = TriviaMockDatabase.GetOrCreateTopicProgress(user, deptCode, topic);
+                if (topicProgress.Status == TriviaMockDatabase.TopicNotStarted)
                 {
-                    deptProgress.Status = "in_progress";
+                    topicProgress.Status = TriviaMockDatabase.TopicInProgress;
                 }
+
+                TriviaMockDatabase.RefreshDepartmentProgress(user, deptCode);
             }
 
             session.Touch();
 
-            int totalQuestions = TriviaMockDatabase.GetTotalQuestionsCount();
+            int totalQuestions = TriviaMockDatabase.GetSessionQuestionsCount(session);
             if (session.CurrentQuestionIndex >= totalQuestions)
             {
                 return Task.FromResult(new GetCurrentQuestionBaseResponsePb
@@ -266,12 +534,18 @@ namespace GrpcTest.Services
                 Department = session.DepartmentCode,
                 CurrentQuestionNumber = session.CurrentQuestionIndex + 1,
                 TotalQuestions = totalQuestions,
+                TopicId = topic.Id,
+                TopicTitle = topic.Title,
+                CategoryCode = topic.CategoryCode,
+                CategoryLabel = topic.CategoryLabel,
                 Question = new TriviaQuestionPb
                 {
                     Id = mockQuestion.Id,
                     Category = mockQuestion.Category,
                     CategoryLabel = mockQuestion.CategoryLabel,
                     CategoryIconKey = mockQuestion.CategoryIconKey,
+                    TopicId = mockQuestion.TopicId,
+                    TopicTitle = mockQuestion.TopicTitle,
                     Title = mockQuestion.Title
                 }
             };
@@ -331,7 +605,7 @@ namespace GrpcTest.Services
                 return Task.FromResult(new SubmitAnswerBaseResponsePb
                 {
                     StatusCode = ErrorCode.ERR010,
-                    Message = string.Format(ErrorMessage.ERR010, idUserProfile)
+                    Message = ErrorMessage.ERR010
                 });
             }
 
@@ -352,7 +626,7 @@ namespace GrpcTest.Services
             // each advance/score it independently.
             lock (session.Lock)
             {
-                int totalQuestions = TriviaMockDatabase.GetTotalQuestionsCount();
+                int totalQuestions = TriviaMockDatabase.GetSessionQuestionsCount(session);
                 if (session.CurrentQuestionIndex >= totalQuestions)
                 {
                     return Task.FromResult(new SubmitAnswerBaseResponsePb
@@ -407,19 +681,16 @@ namespace GrpcTest.Services
 
                 bool isFinished = session.CurrentQuestionIndex >= totalQuestions;
 
-                // Update user progress (completed_questions field)
-                if (user.Departments.TryGetValue(session.DepartmentCode, out var deptProgress))
-                {
-                    deptProgress.CompletedQuestions = session.CurrentQuestionIndex;
-                }
-
                 var response = new SubmitAnswerResponsePb
                 {
                     IsCorrect = isCorrect,
                     CorrectOptionId = mockQuestion.CorrectOptionId,
                     Explanation = mockQuestion.Explanation,
                     IsSessionFinished = isFinished,
-                    XpEarned = xpEarned
+                    XpEarned = xpEarned,
+                    CurrentQuestionNumber = session.CurrentQuestionIndex,
+                    TotalQuestions = totalQuestions,
+                    CorrectAnswersSoFar = session.CorrectAnswersCount
                 };
 
                 var baseResponse = new SubmitAnswerBaseResponsePb
@@ -474,13 +745,13 @@ namespace GrpcTest.Services
                 });
             }
 
-            int totalQuestions = TriviaMockDatabase.GetTotalQuestionsCount();
+            int totalQuestions = TriviaMockDatabase.GetSessionQuestionsCount(session);
             if (session.CurrentQuestionIndex < totalQuestions)
             {
                 return Task.FromResult(new GetRewardsBaseResponsePb
                 {
                     StatusCode = ErrorCode.ERR004,
-                    Message = string.Format(ErrorMessage.ERR004, session.CurrentQuestionIndex, totalQuestions)
+                    Message = ErrorMessage.ERR004
                 });
             }
 
@@ -490,7 +761,17 @@ namespace GrpcTest.Services
                 return Task.FromResult(new GetRewardsBaseResponsePb
                 {
                     StatusCode = ErrorCode.ERR010,
-                    Message = string.Format(ErrorMessage.ERR010, idUserProfile)
+                    Message = ErrorMessage.ERR010
+                });
+            }
+
+            var topic = TriviaCatalog.GetTopic(session.TopicId);
+            if (topic == null)
+            {
+                return Task.FromResult(new GetRewardsBaseResponsePb
+                {
+                    StatusCode = ErrorCode.ERR017,
+                    Message = ErrorMessage.ERR017
                 });
             }
 
@@ -504,31 +785,49 @@ namespace GrpcTest.Services
             user.TotalXp += totalXpEarned;
             user.TotalYastaCoins += yastaCoinsEarned;
 
-            // Mark department as completed and unlock others if applicable
-            var unlockedDepts = new List<string>();
-            if (user.Departments.TryGetValue(session.DepartmentCode, out var deptProgress))
+            // Cierra el tema: queda completado y se guarda el mejor puntaje histórico.
+            var topicProgress = TriviaMockDatabase.GetOrCreateTopicProgress(user, session.DepartmentCode, topic);
+            topicProgress.Status = TriviaMockDatabase.TopicCompleted;
+            topicProgress.TimesCompleted++;
+            topicProgress.LastCompletedAt = BoliviaClock.Now;
+            if (score > topicProgress.BestScore)
             {
-                deptProgress.Status = "completed";
-                deptProgress.CompletedQuestions = totalQuestions;
+                topicProgress.BestScore = score;
+            }
 
-                // If completed department is the opening branch, unlock all other departments
-                if (string.Equals(session.DepartmentCode, user.AccountOpeningBranch, StringComparison.OrdinalIgnoreCase))
-                {
-                    TriviaMockDatabase.UnlockOtherDepartments(user);
-                    foreach (var dept in user.Departments.Values)
-                    {
-                        if (!string.Equals(dept.Code, user.AccountOpeningBranch, StringComparison.OrdinalIgnoreCase))
-                        {
-                            unlockedDepts.Add(dept.Code);
-                        }
-                    }
-                }
+            // Los contadores del departamento se derivan del progreso por tema, así que se
+            // recalculan aquí antes de evaluar el desbloqueo.
+            TriviaMockDatabase.RefreshDepartmentProgress(user, session.DepartmentCode);
+
+            var deptProgress = user.Departments[session.DepartmentCode];
+
+            // Completar la sucursal de apertura sigue siendo lo que desbloquea el resto de
+            // departamentos; se informan solo los que se desbloquearon en esta llamada.
+            var unlockedDepts = new List<string>();
+            if (deptProgress.Status == TriviaMockDatabase.DeptCompleted &&
+                string.Equals(session.DepartmentCode, user.AccountOpeningBranch, StringComparison.OrdinalIgnoreCase))
+            {
+                var lockedBefore = user.Departments.Values
+                    .Where(d => d.Status == TriviaMockDatabase.DeptLocked)
+                    .Select(d => d.Code)
+                    .ToList();
+
+                TriviaMockDatabase.UnlockOtherDepartments(user);
+                unlockedDepts.AddRange(lockedBefore);
             }
 
             var response = new GetRewardsResponsePb
             {
                 SessionId = session.SessionId,
                 Department = session.DepartmentCode,
+                TopicId = topic.Id,
+                TopicTitle = topic.Title,
+                CategoryCode = topic.CategoryCode,
+                CategoryLabel = topic.CategoryLabel,
+                TopicStatus = topicProgress.Status,
+                BestScore = topicProgress.BestScore,
+                CompletedTopicsInDepartment = deptProgress.CompletedTopics,
+                TotalTopicsInDepartment = deptProgress.TotalTopics,
                 Score = new TriviaScorePb
                 {
                     CorrectAnswers = score,
@@ -540,10 +839,10 @@ namespace GrpcTest.Services
                     YastaCoins = yastaCoinsEarned
                 },
                 Message = score >= 7
-                    ? $"¡Excelente trabajo! Lograste un puntaje de {score}/{totalQuestions} y desbloqueaste altas recompensas."
-                    : $"¡Buen intento! Lograste un puntaje de {score}/{totalQuestions}. ¡Sigue aprendiendo y mejora en la siguiente ronda!",
+                    ? $"¡Excelente trabajo! Lograste un puntaje de {score}/{totalQuestions} en {topic.Title} y desbloqueaste altas recompensas."
+                    : $"¡Buen intento! Lograste un puntaje de {score}/{totalQuestions} en {topic.Title}. ¡Sigue aprendiendo y mejora en la siguiente ronda!",
                 WeeklyAttemptsLeft = user.WeeklyAttemptsLeft,
-                DepartmentStatus = "completed"
+                DepartmentStatus = deptProgress.Status
             };
 
             response.UnlockedDepartmentCodes.AddRange(unlockedDepts);
